@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EtherCAT Master</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="container">
+<h1>EtherCAT Master</h1>
+<div class="subtitle">Bus discovery, PDO configuration and connection management</div>
+
+<!-- Bus State -->
+<div class="section-card">
+  <div class="section-card-title">Bus State</div>
+  <div class="status-bar">
+    <span id="stateBadge" class="state-badge state-badge--idle">IDLE</span>
+    <span id="stateInfo" class="state-info"></span>
+  </div>
+  <div id="errorBox" class="error-box" style="display:none"></div>
+</div>
+
+<!-- Adapter Selection -->
+<div class="section-card" id="adapterSection">
+  <div class="section-card-title">Ethernet Adapter <a onclick="refreshAdapters()" style="font-size:10px;font-weight:400;color:var(--text-faint);cursor:pointer;text-transform:none;letter-spacing:0">&#x21bb; refresh</a></div>
+  <div id="adapterGrid" class="net-adapter-grid"></div>
+</div>
+
+<!-- Bus Discovery -->
+<div class="section-card" id="discoverySection">
+  <div class="section-card-title">Bus Discovery</div>
+  <div style="padding:4px 0 10px">
+    <a class="btn" id="btnScan" onclick="scanBus()" style="width:100%;display:block;text-align:center;padding:10px 0;font-size:14px">&#x1F50D; Scan Bus</a>
+  </div>
+  <div id="discoveryStatus" style="padding:4px 0;font-size:12px;color:var(--text-dim)"></div>
+  <div id="discoveryResult"></div>
+</div>
+
+<!-- Control -->
+<div class="section-card">
+  <div class="section-card-title">Control</div>
+  <div class="row">
+    <label>Cycle Time</label>
+    <div class="textBox"><input type="number" id="cycleTime" value="1000" min="50" max="100000" step="10"><h4>&micro;s</h4></div>
+  </div>
+  <div style="padding:8px 0;display:flex;gap:8px">
+    <a class="btn" id="btnGoOp" onclick="doGoOp()">Go OP</a>
+    <a class="btn btn--danger" id="btnStop" onclick="doStop()" style="display:none">Stop</a>
+  </div>
+</div>
+
+<!-- Network Test -->
+<div class="section-card">
+  <div class="section-card-title">Network Latency Test</div>
+  <div style="font-size:12px;color:var(--text-dim);padding:0 0 10px">Measures SDO round-trip latency to a slave while the bus is in OP.</div>
+  <div class="row">
+    <label>Slave</label>
+    <div class="textBox"><input type="number" id="netTestSlave" value="0" min="0" max="255" step="1" style="width:60px"></div>
+    <label style="min-width:auto">Samples</label>
+    <div class="textBox"><input type="number" id="netTestSamples" value="200" min="10" max="2000" step="10" style="width:80px"></div>
+  </div>
+  <div style="padding:8px 0;display:flex;align-items:center;gap:12px">
+    <a class="btn btn--outline" id="btnNetTest" onclick="runNetworkTest()">Run Test</a>
+    <span id="netTestStatus" style="font-size:11px"></span>
+  </div>
+  <div id="netTestResult" style="display:none"></div>
+</div>
+
+<div class="copyright">&copy; 2026 Henschel-Robotics GmbH</div>
+</div>
+
+<script>
+var host = window.location.origin + "/";
+var _selectedAdapter = null;
+var _discoveredSlaves = [];
+var _busState = "IDLE";
+var _pollTimer = null;
+
+function byId(id) { return document.getElementById(id); }
+
+// ---------- State display ----------
+
+function setBusState(state, slaves, error) {
+    _busState = state;
+    var badge = byId("stateBadge");
+    var info = byId("stateInfo");
+    var errBox = byId("errorBox");
+    var btnGoOp = byId("btnGoOp");
+    var btnStop = byId("btnStop");
+    var btnScan = byId("btnScan");
+
+    badge.textContent = state;
+    badge.className = "state-badge state-badge--" + {
+        "IDLE": "idle", "PRE-OP": "preop", "SAFE-OP": "safeop", "OP": "op", "ERROR": "err"
+    }[state] || "idle";
+
+    if (state === "OP" && slaves) {
+        info.textContent = slaves + " slave(s) in OP";
+    } else if (state === "IDLE") {
+        info.textContent = "";
+    } else {
+        info.textContent = "";
+    }
+
+    if (error) {
+        errBox.textContent = error;
+        errBox.style.display = "block";
+    } else {
+        errBox.style.display = "none";
+    }
+
+    var isOp = (state === "OP");
+    btnGoOp.style.display = isOp ? "none" : "";
+    btnStop.style.display = isOp ? "" : "none";
+    btnScan.classList.toggle("btn--disabled", isOp);
+    byId("cycleTime").disabled = isOp;
+
+    if (isOp && !_pollTimer) {
+        _pollTimer = setInterval(pollStatus, 3000);
+    } else if (!isOp && _pollTimer) {
+        clearInterval(_pollTimer);
+        _pollTimer = null;
+    }
+}
+
+function pollStatus() {
+    fetch(host + "api/status").then(function(r){return r.json();}).then(function(data) {
+        if (data.state && data.state !== _busState) {
+            setBusState(data.state, data.slaves, data.error);
+        }
+    }).catch(function(){});
+}
+
+// ---------- Adapters ----------
+
+var ethIcon = '<svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="7" width="20" height="10" rx="2"/><line x1="6" y1="12" x2="6" y2="12.01"/><line x1="10" y1="12" x2="10" y2="12.01"/><line x1="14" y1="12" x2="14" y2="12.01"/><line x1="18" y1="12" x2="18" y2="12.01"/><line x1="6" y1="7" x2="6" y2="4"/><line x1="18" y1="7" x2="18" y2="4"/></svg>';
+
+function refreshAdapters() {
+    fetch(host + "api/adapters").then(function(r){return r.json();}).then(function(data) {
+        if (data.error) return;
+        var grid = byId("adapterGrid");
+        grid.innerHTML = "";
+        (data.adapters || []).forEach(function(a) {
+            var card = document.createElement("div");
+            card.className = "net-adapter-card" + (a.name === data.current ? " selected" : "");
+            card.innerHTML = '<div class="net-adapter-icon">' + ethIcon + '</div><div><div class="net-adapter-name">' + a.desc + '</div><div class="net-adapter-path">' + a.name + '</div></div>';
+            card.onclick = function() {
+                if (_busState === "OP") return;
+                grid.querySelectorAll(".net-adapter-card").forEach(function(c){c.classList.remove("selected");});
+                card.classList.add("selected");
+                _selectedAdapter = a.name;
+            };
+            grid.appendChild(card);
+            if (a.name === data.current) _selectedAdapter = a.name;
+        });
+        if (_selectedAdapter == null && data.adapters.length) {
+            _selectedAdapter = data.adapters[0].name;
+            var first = grid.querySelector(".net-adapter-card");
+            if (first) first.classList.add("selected");
+        }
+        if (data.state) setBusState(data.state, null, null);
+    }).catch(function(){});
+}
+
+// ---------- Go OP / Stop ----------
+
+function doGoOp() {
+    setBusState("IDLE", null, null);
+    byId("stateInfo").textContent = "Connecting...";
+    byId("stateBadge").textContent = "INIT";
+    byId("stateBadge").className = "state-badge state-badge--preop";
+    byId("btnGoOp").classList.add("btn--disabled");
+
+    var cycleUs = parseFloat(byId("cycleTime").value);
+    var cycle = cycleUs / 1000;
+    var params = "adapter=" + encodeURIComponent(_selectedAdapter) + "&cycle=" + cycle;
+    fetch(host + "api/connect?" + params).then(function(r){return r.json();}).then(function(data) {
+        byId("btnGoOp").classList.remove("btn--disabled");
+        if (data.error) {
+            setBusState("IDLE", null, data.error);
+        } else {
+            setBusState(data.state || "OP", data.slaves, null);
+        }
+    }).catch(function(e) {
+        byId("btnGoOp").classList.remove("btn--disabled");
+        setBusState("IDLE", null, "Request failed: " + e);
+    });
+}
+
+function doStop() {
+    byId("btnStop").classList.add("btn--disabled");
+    fetch(host + "api/disconnect").then(function(r){return r.json();}).then(function() {
+        byId("btnStop").classList.remove("btn--disabled");
+        setBusState("IDLE", null, null);
+    }).catch(function(){
+        byId("btnStop").classList.remove("btn--disabled");
+        setBusState("IDLE", null, null);
+    });
+}
+
+// ---------- PDO helpers ----------
+
+function pdoLabel(p) {
+    var lbl = p.pdo_index;
+    if (p.objects && p.objects.length) {
+        lbl += ": " + p.objects.map(function(o){return o.index+":"+o.subindex+" ("+o.bits+"b)";}).join(", ");
+    }
+    return lbl;
+}
+
+function pdoCheckboxes(slaveIdx, dir, availList, assignedList) {
+    if (!availList || !availList.length) return "";
+    var assigned = {};
+    (assignedList || []).forEach(function(p){assigned[p.pdo_index]=true;});
+    var label = dir==="rx" ? "RxPDO (Master &rarr; Slave)" : "TxPDO (Slave &rarr; Master)";
+    var h = "<div style='font-size:10px;font-weight:600;color:var(--text-dim);margin-bottom:2px;margin-top:6px'>"+label+"</div>";
+    availList.forEach(function(p) {
+        var id = "pdoCb_"+slaveIdx+"_"+dir+"_"+p.pdo_index;
+        var chk = assigned[p.pdo_index] ? " checked" : "";
+        h += "<label style='display:flex;align-items:flex-start;gap:6px;padding:2px 0 2px 8px;font-size:11px;color:var(--text-faint);cursor:pointer'><input type='checkbox' id='"+id+"'"+chk+" style='margin-top:2px'><span>"+pdoLabel(p)+"</span></label>";
+    });
+    return h;
+}
+
+function savePdoConfig() {
+    var cycleUs = parseFloat(byId("cycleTime").value);
+    var payload = {
+        network: {
+            adapter: _selectedAdapter,
+            cycle_ms: cycleUs / 1000
+        },
+        slaves: {}
+    };
+    _discoveredSlaves.forEach(function(s) {
+        var rx=[], tx=[];
+        (s.available_rx_pdo||[]).forEach(function(p){
+            var cb = byId("pdoCb_"+s.index+"_rx_"+p.pdo_index);
+            if (cb && cb.checked) rx.push(p.pdo_index);
+        });
+        (s.available_tx_pdo||[]).forEach(function(p){
+            var cb = byId("pdoCb_"+s.index+"_tx_"+p.pdo_index);
+            if (cb && cb.checked) tx.push(p.pdo_index);
+        });
+        payload.slaves[String(s.index)] = {rx_pdo:rx, tx_pdo:tx};
+    });
+    var statusEl = byId("pdoSaveStatus");
+    if (statusEl) statusEl.innerHTML = "<span style='color:var(--accent)'>Saving...</span>";
+    fetch(host+"api/pdo_config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)})
+    .then(function(r){return r.json();}).then(function(d){
+        if (d.error) { if(statusEl) statusEl.innerHTML="<span style='color:var(--danger)'>"+d.error+"</span>"; return; }
+        if (_busState === "OP") {
+            if(statusEl) statusEl.innerHTML="<span style='color:var(--accent)'>Saved. Reconnecting...</span>";
+            saveAndReconnect(statusEl);
+        } else {
+            if(statusEl) statusEl.innerHTML="<span style='color:var(--accent)'>Saved. Scanning &amp; going OP...</span>";
+            saveAndReconnect(statusEl);
+        }
+    }).catch(function(e){ if(statusEl) statusEl.innerHTML="<span style='color:var(--danger)'>"+e+"</span>"; });
+}
+
+function saveAndReconnect(statusEl) {
+    var params = _selectedAdapter != null ? "?adapter="+encodeURIComponent(_selectedAdapter) : "";
+    fetch(host+"api/disconnect").then(function(r){return r.json();})
+    .then(function() {
+        setBusState("IDLE", null, null);
+        if(statusEl) statusEl.innerHTML="<span style='color:var(--accent)'>Scanning bus...</span>";
+        return fetch(host+"api/discover"+params);
+    })
+    .then(function(r){return r.json();})
+    .then(function(data) {
+        if (data.error) { if(statusEl) statusEl.innerHTML="<span style='color:var(--danger)'>Scan failed: "+data.error+"</span>"; return; }
+        if(statusEl) statusEl.innerHTML="<span style='color:var(--accent)'>Going OP...</span>";
+        doGoOp();
+        if(statusEl) statusEl.innerHTML="<span style='color:var(--success)'>Done</span>";
+    })
+    .catch(function(e){ if(statusEl) statusEl.innerHTML="<span style='color:var(--danger)'>Reconnect failed: "+e+"</span>"; });
+}
+
+// ---------- Bus Discovery ----------
+
+function scanBus() {
+    if (_busState === "OP") return;
+    var statusEl = byId("discoveryStatus");
+    var resultEl = byId("discoveryResult");
+    statusEl.innerHTML = "<span class='status status--run'>Scanning...</span>";
+    resultEl.innerHTML = "";
+    _discoveredSlaves = [];
+    var params = _selectedAdapter != null ? "?adapter="+encodeURIComponent(_selectedAdapter) : "";
+    fetch(host+"api/discover"+params).then(function(r){return r.json();}).then(function(data) {
+        if (data.error) { statusEl.innerHTML="<span class='status status--err'>"+data.error+"</span>"; return; }
+        var slaves = data.slaves || [];
+        if (!slaves.length) { statusEl.innerHTML="<span style='color:var(--text-dim)'>No slaves found.</span>"; return; }
+        _discoveredSlaves = slaves;
+        statusEl.innerHTML = "<span class='status status--ok'>"+slaves.length+" slave(s) found</span>";
+        var html = "";
+        slaves.forEach(function(s) {
+            var rxCb = pdoCheckboxes(s.index, "rx", s.available_rx_pdo, s.rx_pdo);
+            var txCb = pdoCheckboxes(s.index, "tx", s.available_tx_pdo, s.tx_pdo);
+            var pdoHtml = "";
+            if (rxCb || txCb) {
+                pdoHtml = "<details onclick='event.stopPropagation()' style='margin-top:8px'><summary style='font-size:11px;color:var(--text-dim)'>PDO Configuration</summary><div style='margin-top:6px'>"+rxCb+txCb+"</div></details>";
+            }
+            html += "<div class='net-disc-slave' style='padding:10px 14px;border-top:1px solid var(--border)'>" +
+                "<div style='display:flex;align-items:center;gap:10px'>" +
+                "<div style='background:var(--bg-panel);border-radius:6px;width:36px;height:36px;display:flex;align-items:center;justify-content:center;font-weight:700;color:var(--accent);font-size:15px'>"+s.index+"</div>" +
+                "<div style='flex:1'>" +
+                "<div style='font-weight:600;font-size:13px'>"+(s.device_name||s.name||"Slave "+s.index)+"</div>" +
+                "<div style='font-size:11px;color:var(--text-dim)'>Vendor "+s.vendor_id+" &middot; Product "+s.product_code+" &middot; Rev "+s.revision+
+                (s.hw_version?" &middot; HW "+s.hw_version:"")+(s.fw_version?" &middot; FW "+s.fw_version:"")+"</div>" +
+                "</div>" +
+                "<div style='text-align:right;font-size:11px;color:var(--text-dim)'><span style='color:var(--accent);font-weight:600'>"+s.state+"</span><br>In "+s.input_bytes+"B / Out "+s.output_bytes+"B</div>" +
+                "</div>" + pdoHtml + "</div>";
+        });
+        html += "<div style='padding:10px 14px;border-top:1px solid var(--border);display:flex;align-items:center;gap:12px'><button class='btn' onclick='savePdoConfig()' style='font-size:12px;padding:5px 16px'>Save PDO Config</button><span id='pdoSaveStatus' style='font-size:11px'></span></div>";
+        resultEl.innerHTML = html;
+    }).catch(function(e){ statusEl.innerHTML="<span class='status status--err'>"+e+"</span>"; });
+}
+
+// ---------- Network Test ----------
+
+function runNetworkTest() {
+    if (_busState !== "OP") {
+        byId("netTestStatus").innerHTML = "<span style='color:var(--danger)'>Bus must be in OP</span>";
+        return;
+    }
+    var slave = byId("netTestSlave").value;
+    var samples = byId("netTestSamples").value;
+    var btn = byId("btnNetTest");
+    var statusEl = byId("netTestStatus");
+    var resultEl = byId("netTestResult");
+
+    btn.classList.add("btn--disabled");
+    statusEl.innerHTML = "<span style='color:var(--accent)'>Running " + samples + " SDO reads...</span>";
+    resultEl.style.display = "none";
+
+    fetch(host + "api/run_network_test?slave=" + slave + "&samples=" + samples)
+    .then(function(r){return r.json();}).then(function(data) {
+        btn.classList.remove("btn--disabled");
+        if (data.error) {
+            statusEl.innerHTML = "<span style='color:var(--danger)'>" + data.error + "</span>";
+            return;
+        }
+        statusEl.innerHTML = "<span style='color:var(--success)'>Done</span>";
+        showNetTestResult(data);
+    }).catch(function(e) {
+        btn.classList.remove("btn--disabled");
+        statusEl.innerHTML = "<span style='color:var(--danger)'>" + e + "</span>";
+    });
+}
+
+function showNetTestResult(data) {
+    var el = byId("netTestResult");
+    el.style.display = "block";
+
+    var statsHtml =
+        "<table style='width:100%;font-size:12px;border-collapse:collapse;margin-bottom:12px'>" +
+        "<tr style='border-bottom:1px solid var(--border)'><td style='padding:4px 8px;color:var(--text-dim)'>Samples</td><td style='padding:4px 8px;font-weight:600'>" + data.count + " <span style='color:var(--text-faint);font-weight:400'>(errors: " + data.errors + ")</span></td>" +
+        "<td style='padding:4px 8px;color:var(--text-dim)'>Mean</td><td style='padding:4px 8px;font-weight:600'>" + data.mean_ms + " ms</td></tr>" +
+        "<tr style='border-bottom:1px solid var(--border)'><td style='padding:4px 8px;color:var(--text-dim)'>Min</td><td style='padding:4px 8px;font-weight:600'>" + data.min_ms + " ms</td>" +
+        "<td style='padding:4px 8px;color:var(--text-dim)'>Max</td><td style='padding:4px 8px;font-weight:600'>" + data.max_ms + " ms</td></tr>" +
+        "<tr style='border-bottom:1px solid var(--border)'><td style='padding:4px 8px;color:var(--text-dim)'>Median</td><td style='padding:4px 8px;font-weight:600'>" + data.median_ms + " ms</td>" +
+        "<td style='padding:4px 8px;color:var(--text-dim)'>Std Dev</td><td style='padding:4px 8px;font-weight:600'>" + data.std_ms + " ms</td></tr>" +
+        "<tr><td style='padding:4px 8px;color:var(--text-dim)'>P95</td><td style='padding:4px 8px;font-weight:600'>" + data.p95_ms + " ms</td>" +
+        "<td style='padding:4px 8px;color:var(--text-dim)'>P99</td><td style='padding:4px 8px;font-weight:600'>" + data.p99_ms + " ms</td></tr>" +
+        "</table>";
+
+    var histHtml = renderHistogram(data.samples);
+
+    el.innerHTML = statsHtml + histHtml;
+}
+
+function renderHistogram(samples) {
+    if (!samples || !samples.length) return "";
+
+    var min = samples[0], max = samples[0];
+    for (var i = 1; i < samples.length; i++) {
+        if (samples[i] < min) min = samples[i];
+        if (samples[i] > max) max = samples[i];
+    }
+
+    var bins = 20;
+    var range = max - min;
+    if (range < 0.001) range = 0.001;
+    var binWidth = range / bins;
+    var counts = [];
+    for (var b = 0; b < bins; b++) counts[b] = 0;
+
+    for (var j = 0; j < samples.length; j++) {
+        var idx = Math.floor((samples[j] - min) / binWidth);
+        if (idx >= bins) idx = bins - 1;
+        counts[idx]++;
+    }
+
+    var maxCount = 0;
+    for (var k = 0; k < bins; k++) if (counts[k] > maxCount) maxCount = counts[k];
+
+    var barH = 80;
+    var html = "<div style='display:flex;align-items:flex-end;gap:2px;height:" + barH + "px;padding:0 4px'>";
+    for (var m = 0; m < bins; m++) {
+        var h = maxCount > 0 ? Math.round((counts[m] / maxCount) * barH) : 0;
+        if (h < 1 && counts[m] > 0) h = 1;
+        var label = (min + m * binWidth).toFixed(2);
+        html += "<div title='" + label + " ms: " + counts[m] + "' style='flex:1;background:var(--accent);border-radius:2px 2px 0 0;height:" + h + "px;min-width:4px;transition:height .2s'></div>";
+    }
+    html += "</div>";
+    html += "<div style='display:flex;justify-content:space-between;font-size:9px;color:var(--text-faint);padding:2px 4px 0'><span>" + min.toFixed(2) + " ms</span><span>" + max.toFixed(2) + " ms</span></div>";
+
+    return html;
+}
+
+// ---------- Init ----------
+
+refreshAdapters();
+fetch(host+"api/connection").then(function(r){return r.json();}).then(function(data) {
+    if (data.cycle != null) byId("cycleTime").value = Math.round(data.cycle * 1000);
+    setBusState(data.state || "IDLE", data.slaves, data.error);
+}).catch(function(){});
+</script>
+</body>
+</html>
