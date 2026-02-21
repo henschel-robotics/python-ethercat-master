@@ -4,6 +4,8 @@ Generic EtherCAT master library built on [PySOEM](https://github.com/bnjmnp/pyso
 
 Developed by [Henschel Robotics GmbH](https://henschel-robotics.ch).
 
+![EtherCAT Master Web GUI](docs/images/01-bus-overview.png)
+
 ## Features
 
 - **Bus management** -- connect, configure, and run an EtherCAT bus with one or more slaves
@@ -149,12 +151,23 @@ ecmaster-web --port 8080
 ecmaster-web --pdo-config /path/to/pdo_mapping.json
 ```
 
-Then open `http://localhost:8080` in your browser. The web GUI lets you:
+Then open `http://localhost:8080` in your browser.
+
+![EtherCAT Master Web GUI](docs/images/01-bus-overview.png)
+
+The web GUI lets you:
 
 - Select a network adapter
 - Scan the bus and view all slaves with their identity and I/O sizes
 - Configure PDO assignments per slave
 - Set the cycle time and go to OP state
+- Run network latency tests (SDO round-trip measurement with histogram)
+
+| Network Latency Test |
+|---|
+| ![Network Test](docs/images/02-network-test.png) |
+
+> **Full guide:** [`docs/web-interface.md`](docs/web-interface.md)
 
 ## Project Structure
 
