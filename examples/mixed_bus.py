@@ -12,16 +12,12 @@ just like GenericSlave. You can mix HDrive motors and generic
 terminals on the same bus.
 """
 
-import os
 import time
 from ethercat_master import EtherCATBus, GenericSlave
 from hdrive_etc import HDriveETC, Mode
 
-ADAPTER = None  # set to adapter name string, e.g. r"\Device\NPF_{...}"
-PDO_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ethercat_config.json")
-
 # -- Create shared bus --
-bus = EtherCATBus(adapter=ADAPTER, cycle_time_ms=1, pdo_config_path=PDO_CONFIG)
+bus = EtherCATBus(pdo_config_path="ethercat_config.json")
 
 # -- HDrive motor on slave 0 --
 motor = HDriveETC(slave_index=0, bus=bus)

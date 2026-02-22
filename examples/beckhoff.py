@@ -18,7 +18,7 @@ the SII EEPROM works fine — no ethercat_config.json needed.
 import time
 from ethercat_master import EtherCATBus, GenericSlave
 
-ADAPTER = None  # set to adapter name string, e.g. r"\Device\NPF_{...}"
+ADAPTER = "eth0"  # set to adapter name string, e.g. r"\Device\NPF_{...}"
 
 # -- Discover what's on the bus first --
 print("Scanning bus...")
@@ -29,7 +29,7 @@ for s in slaves_info:
 
 # -- Register only slaves that have actual I/O --
 handles = []
-bus = EtherCATBus(adapter=ADAPTER, cycle_time_ms=1)
+bus = EtherCATBus(pdo_config_path="ethercat_config.json")
 
 for s in slaves_info:
     if s["input_bytes"] > 0 or s["output_bytes"] > 0:
