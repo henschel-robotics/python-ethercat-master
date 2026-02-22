@@ -42,13 +42,41 @@ sudo apt install libpcap-dev
 sudo dnf install libpcap-devel
 ```
 
-On Linux you must run as **root** or grant the `CAP_NET_RAW` capability:
+On Linux, raw Ethernet access requires **root**. Either run with `sudo` or grant the capability once:
 
 ```bash
-sudo setcap cap_net_raw=ep $(which python3)
+# Option A – run with sudo
+sudo pip install ethercat-master --break-system-packages
+sudo ecmaster-web
+
+# Option B – grant raw socket capability (no sudo needed afterwards)
+sudo setcap cap_net_raw=ep $(readlink -f $(which python3))
 ```
 
 > Npcap is **not** needed on Linux -- `libpcap` provides the same functionality and is BSD-licensed.
+
+### Raspberry Pi Quick-Start
+
+```bash
+# 1. Install libpcap
+sudo apt update
+sudo apt install libpcap-dev
+
+# 2. Install ethercat-master system-wide (so sudo can find it)
+sudo pip install ethercat-master --break-system-packages
+
+# 3. Add ~/.local/bin to PATH (if not already)
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+source ~/.bashrc
+
+# 4. Launch the web interface (requires root for raw Ethernet)
+sudo ecmaster-web --adapter eth0
+```
+
+Open `http://<pi-ip>:8080` from any device on your network.
+
+> Connect the EtherCAT slave(s) directly to the Pi's Ethernet port (`eth0`).
+> Use Wi-Fi or a second USB-Ethernet adapter for SSH / network access.
 
 ### Python
 
@@ -141,12 +169,19 @@ bus = EtherCATBus(adapter=..., cycle_time_ms=1, pdo_config_path="pdo_mapping.jso
 
 Or use the web interface to scan the bus, select PDOs with checkboxes, and save.
 
+> **Raspberry Pi / Linux:** When installed via pip, the default `pdo_mapping.json` is inside the package directory (e.g. `/usr/local/lib/python3.13/dist-packages/ethercat_master/pdo_mapping.json`). Copy it to your working directory for easy editing:
+>
+> ```bash
+> cp $(python3 -c "import ethercat_master, os; print(os.path.join(os.path.dirname(ethercat_master.__file__), 'pdo_mapping.json'))") .
+> ```
+
 ## Web Interface
 
 Start the built-in web server:
 
 ```bash
-ecmaster-web
+ecmaster-web                                        # Windows
+sudo ecmaster-web                                   # Linux (requires root)
 ecmaster-web --port 8080
 ecmaster-web --pdo-config /path/to/pdo_mapping.json
 ```

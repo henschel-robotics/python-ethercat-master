@@ -130,6 +130,8 @@ _SKIP_ADAPTERS = (
     "wi-fi direct", "wan miniport", "hyper-v",
 )
 
+_SKIP_LINUX_IFACES = ("lo", "wlan", "wlp", "docker", "br-", "veth", "virbr")
+
 bus_state: BusState = None  # set in main()
 
 _WEBGUI_DIR = Path(__file__).parent / "webgui"
@@ -162,6 +164,8 @@ class _Handler(BaseHTTPRequestHandler):
                     name = a.name.decode("utf-8", errors="replace") if isinstance(a.name, bytes) else str(a.name)
                     desc = a.desc.decode("utf-8", errors="replace") if isinstance(a.desc, bytes) else str(a.desc)
                     if any(s in desc.lower() for s in _SKIP_ADAPTERS):
+                        continue
+                    if any(name.startswith(p) for p in _SKIP_LINUX_IFACES):
                         continue
                     result.append({"name": name, "desc": desc})
                 self._send_json({

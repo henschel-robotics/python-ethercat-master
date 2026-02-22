@@ -37,9 +37,11 @@ Bus discovery (no OP transition)::
 
 """
 
+import json
 import struct
 import threading
 import time
+from pathlib import Path
 
 import pysoem
 
@@ -85,9 +87,18 @@ class EtherCATBus:
     """
 
     def __init__(self, adapter=None, cycle_time_ms=10, pdo_config_path=None):
+        if pdo_config_path:
+            self.pdo_config = load_pdo_config(pdo_config_path)
+            net = self._read_network_config(pdo_config_path)
+            if adapter is None and net.get("adapter"):
+                adapter = net["adapter"]
+            if cycle_time_ms == 10 and net.get("cycle_ms"):
+                cycle_time_ms = net["cycle_ms"]
+        else:
+            self.pdo_config = None
+
         self.adapter = adapter
         self.cycle_time = cycle_time_ms / 1000.0
-        self.pdo_config = load_pdo_config(pdo_config_path) if pdo_config_path else None
 
         self.master = None
         self._slaves = []
@@ -125,6 +136,15 @@ class EtherCATBus:
                 self.close()
         except Exception:
             pass
+
+    @staticmethod
+    def _read_network_config(pdo_config_path):
+        """Read the 'network' section from a pdo_mapping.json file."""
+        try:
+            raw = json.loads(Path(pdo_config_path).read_text(encoding="utf-8"))
+            return raw.get("network", {})
+        except Exception:
+            return {}
 
     # ------------------------------------------------------------------
     # Adapter discovery
