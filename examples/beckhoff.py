@@ -12,7 +12,7 @@ Typical bus layout:
   ...
 
 For standard Beckhoff terminals the factory default PDO mapping from
-the SII EEPROM works fine — no pdo_mapping.json needed.
+the SII EEPROM works fine — no ethercat_config.json needed.
 """
 
 import time

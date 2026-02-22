@@ -81,7 +81,7 @@ class EtherCATBus:
             ``\\Device\\NPF_{GUID}``).  Use :meth:`list_adapters` to
             enumerate available adapters and their names.
         cycle_time_ms: PDO update cycle time in milliseconds.
-        pdo_config_path: Optional path to a ``pdo_mapping.json`` file.
+        pdo_config_path: Optional path to an ``ethercat_config.json`` file.
             When provided, per-slave PDO assignments are read from
             this file instead of using the hardcoded defaults.
     """
@@ -139,7 +139,7 @@ class EtherCATBus:
 
     @staticmethod
     def _read_network_config(pdo_config_path):
-        """Read the 'network' section from a pdo_mapping.json file."""
+        """Read the 'network' section from an ethercat_config.json file."""
         try:
             raw = json.loads(Path(pdo_config_path).read_text(encoding="utf-8"))
             return raw.get("network", {})
@@ -191,7 +191,7 @@ class EtherCATBus:
 
         Args:
             adapter: Network-adapter name/UID string.
-            pdo_config_path: Optional path to a ``pdo_mapping.json``
+            pdo_config_path: Optional path to an ``ethercat_config.json``
                 file.  Per-slave PDO assignments are applied before
                 ``config_map`` so that I/O sizes reflect the intended
                 mapping.

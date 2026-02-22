@@ -1,5 +1,5 @@
 """
-Minimal example: connect to one EtherCAT slave using pdo_mapping.json
+Minimal example: connect to one EtherCAT slave using ethercat_config.json
 """
 
 import os
@@ -8,7 +8,7 @@ from ethercat_master import EtherCATBus, GenericSlave
 
 ADAPTER = None  # set to adapter name string, e.g. r"\Device\NPF_{...}"
 SLAVE = 0
-PDO_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "pdo_mapping.json")
+PDO_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ethercat_config.json")
 
 print("Available adapters:")
 for a in EtherCATBus.list_adapters():

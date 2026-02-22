@@ -36,7 +36,7 @@ class GenericSlave:
     For devices with standard SII PDO mappings (e.g. Beckhoff terminals),
     set ``use_default_pdo=True`` (the default) to skip custom PDO
     configuration.  For devices that need explicit PDO assignments from
-    ``pdo_mapping.json``, set ``use_default_pdo=False``.
+    ``ethercat_config.json``, set ``use_default_pdo=False``.
 
     Args:
         slave_index: EtherCAT slave position on the bus.

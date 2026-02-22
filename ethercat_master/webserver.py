@@ -13,7 +13,7 @@ Usage::
 
     python -m ethercat_master.webserver
     python -m ethercat_master.webserver --port 8080
-    python -m ethercat_master.webserver --pdo-config pdo_mapping.json
+    python -m ethercat_master.webserver --pdo-config ethercat_config.json
 
 Then open http://localhost:8080 in your browser.
 """
@@ -352,12 +352,12 @@ def main():
     parser.add_argument("--adapter", type=str, default=None,
                         help="Adapter name/UID (e.g. \\Device\\NPF_{...})")
     parser.add_argument("--pdo-config", type=str, default=None,
-                        help="Path to pdo_mapping.json")
+                        help="Path to ethercat_config.json")
     args = parser.parse_args()
 
     pdo_path = args.pdo_config
     if not pdo_path:
-        candidate = Path(__file__).parent / "pdo_mapping.json"
+        candidate = Path(__file__).parent / "ethercat_config.json"
         if not candidate.exists():
             candidate.write_text('{"network": {}, "default": {}, "slaves": {}}\n', encoding="utf-8")
         pdo_path = str(candidate)

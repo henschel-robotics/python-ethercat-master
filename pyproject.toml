@@ -52,7 +52,7 @@ include = ["ethercat_master*"]
 [tool.setuptools.package-data]
 ethercat_master = [
     "webgui/**/*",
-    "pdo_mapping.json",
+    "ethercat_config.json",
 ]
 
 [tool.ruff]

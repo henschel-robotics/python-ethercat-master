@@ -5,7 +5,7 @@ The built-in web interface lets you manage your EtherCAT bus from any browser. S
 ```bash
 ecmaster-web
 ecmaster-web --port 8080
-ecmaster-web --pdo-config /path/to/pdo_mapping.json
+ecmaster-web --pdo-config /path/to/ethercat_config.json
 ```
 
 Then open **http://localhost:8080**.
@@ -35,11 +35,15 @@ If an error occurs (e.g. failed state transition), a detailed error box appears 
 
 All detected Ethernet adapters are listed as cards. Click one to select it. Wi-Fi, Bluetooth, and loopback adapters are filtered out automatically.
 
-The selected adapter is remembered in `pdo_mapping.json` so you don't have to pick it again next time.
+The selected adapter is remembered in `ethercat_config.json` so you don't have to pick it again next time.
 
 ### Bus Discovery
 
-Click **Scan Bus** to detect all EtherCAT slaves on the selected adapter. For each slave the GUI shows:
+Click **Scan Bus** to detect all EtherCAT slaves on the selected adapter. The web GUI discovers **any** EtherCAT device — not just Henschel Robotics products. Third-party devices such as Beckhoff terminals (EK1100 couplers, EL3xxx analog inputs, EL2xxx digital outputs, etc.) are detected and displayed alongside HDrive motors.
+
+![Mixed bus with Beckhoff terminals](images/03-bus-discovery-mixed.png)
+
+For each slave the GUI shows:
 
 - **Device name**, vendor ID, product code, revision
 - **Hardware / firmware version** (if available)
@@ -48,7 +52,7 @@ Click **Scan Bus** to detect all EtherCAT slaves on the selected adapter. For ea
 
 ### PDO Configuration
 
-Expand the **PDO Configuration** section on any slave to see the available RxPDO and TxPDO assignments. Check/uncheck PDOs and click **Save PDO Config** to persist the selection to `pdo_mapping.json`.
+Expand the **PDO Configuration** section on any slave to see the available RxPDO and TxPDO assignments. Check/uncheck PDOs and click **Save PDO Config** to persist the selection to `ethercat_config.json`.
 
 After saving, the system automatically disconnects, re-scans the bus, and goes to OP with the new mapping applied.
 
@@ -85,5 +89,5 @@ ecmaster-web [OPTIONS]
   --port PORT           HTTP port (default: 8080)
   --adapter ADAPTER     Network adapter name (e.g. "\Device\NPF_{...}")
   --cycle MICROSECONDS  PDO cycle time in µs (default: 1000)
-  --pdo-config PATH     Path to pdo_mapping.json
+  --pdo-config PATH     Path to ethercat_config.json
 ```

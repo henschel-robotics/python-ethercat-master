@@ -11,7 +11,7 @@ Developed by [Henschel Robotics GmbH](https://henschel-robotics.ch).
 - **Bus management** -- connect, configure, and run an EtherCAT bus with one or more slaves
 - **Generic slave handle** -- read/write raw PDO bytes for any device (Beckhoff terminals, servos, I/O modules, ...)
 - **PDO mapping** -- configure SyncManager assignments per slave via a JSON file or SDO writes
-- **Bus discovery** -- scan the bus and inspect each slave's identity, I/O sizes, and available PDOs
+- **Bus discovery** -- scan the bus and detect any EtherCAT device (Beckhoff, Henschel, or any other vendor)
 - **Auto-reconnect** -- background health monitoring with automatic recovery on cable disconnect
 - **Web interface** -- built-in browser GUI for adapter selection, bus scanning, PDO configuration, and going OP
 - **Extensible** -- subclass `GenericSlave` or implement the slave handle interface to build device-specific drivers (see [python-hdrive-etc](https://github.com/henschel-robotics/python-hdrive-etc))
@@ -143,7 +143,7 @@ for s in slaves:
 
 ## PDO Configuration
 
-Create a `pdo_mapping.json` to control which PDOs are assigned per slave:
+Create a `ethercat_config.json` to control which PDOs are assigned per slave:
 
 ```json
 {
@@ -164,15 +164,15 @@ Create a `pdo_mapping.json` to control which PDOs are assigned per slave:
 Pass it when creating the bus:
 
 ```python
-bus = EtherCATBus(adapter=..., cycle_time_ms=1, pdo_config_path="pdo_mapping.json")
+bus = EtherCATBus(adapter=..., cycle_time_ms=1, pdo_config_path="ethercat_config.json")
 ```
 
 Or use the web interface to scan the bus, select PDOs with checkboxes, and save.
 
-> **Raspberry Pi / Linux:** When installed via pip, the default `pdo_mapping.json` is inside the package directory (e.g. `/usr/local/lib/python3.13/dist-packages/ethercat_master/pdo_mapping.json`). Copy it to your working directory for easy editing:
+> **Raspberry Pi / Linux:** When installed via pip, the default `ethercat_config.json` is inside the package directory (e.g. `/usr/local/lib/python3.13/dist-packages/ethercat_master/ethercat_config.json`). Copy it to your working directory for easy editing:
 >
 > ```bash
-> cp $(python3 -c "import ethercat_master, os; print(os.path.join(os.path.dirname(ethercat_master.__file__), 'pdo_mapping.json'))") .
+> cp $(python3 -c "import ethercat_master, os; print(os.path.join(os.path.dirname(ethercat_master.__file__), 'ethercat_config.json'))") .
 > ```
 
 ## Web Interface
@@ -183,7 +183,7 @@ Start the built-in web server:
 ecmaster-web                                        # Windows
 sudo ecmaster-web                                   # Linux (requires root)
 ecmaster-web --port 8080
-ecmaster-web --pdo-config /path/to/pdo_mapping.json
+ecmaster-web --pdo-config /path/to/ethercat_config.json
 ```
 
 Then open `http://localhost:8080` in your browser.
@@ -193,14 +193,14 @@ Then open `http://localhost:8080` in your browser.
 The web GUI lets you:
 
 - Select a network adapter
-- Scan the bus and view all slaves with their identity and I/O sizes
+- Scan the bus and discover **any EtherCAT device** — Beckhoff terminals, IO modules, servo drives, and more
 - Configure PDO assignments per slave
 - Set the cycle time and go to OP state
 - Run network latency tests (SDO round-trip measurement with histogram)
 
-| Network Latency Test |
-|---|
-| ![Network Test](docs/images/02-network-test.png) |
+| Mixed bus (Beckhoff + HDrive) | Network Latency Test |
+|---|---|
+| ![Mixed Bus](docs/images/03-bus-discovery-mixed.png) | ![Network Test](docs/images/02-network-test.png) |
 
 > **Full guide:** [`docs/web-interface.md`](docs/web-interface.md)
 
@@ -222,9 +222,40 @@ python-ethercat-master/
 │   ├── connect.py           # Minimal single-slave example
 │   ├── beckhoff.py          # Beckhoff EK1100 + terminals
 │   └── mixed_bus.py         # HDrive motor + Beckhoff terminals
-├── pdo_mapping.json         # Example PDO config
+├── ethercat_config.json         # Example PDO config
 └── pyproject.toml
 ```
+
+## Examples
+
+The [`examples/`](examples/) folder contains ready-to-run scripts. The recommended workflow is:
+
+1. **Configure the bus** using the web interface (`ecmaster-web`):
+   - Select your network adapter
+   - Click **Scan Bus** to discover all slaves
+   - Expand each slave and configure the PDO assignments
+   - Click **Save PDO Config** — this writes `ethercat_config.json` with the adapter, cycle time, and per-slave PDO mapping
+
+2. **Copy `ethercat_config.json`** next to your script (or point to it with `pdo_config_path`)
+
+3. **Run the example** — the bus uses the preconfigured adapter and PDO mapping from the file:
+
+```bash
+sudo python3 examples/connect.py          # Linux
+python examples\connect.py                 # Windows
+```
+
+### `connect.py` — Minimal single-slave example
+
+Connects to one slave and continuously prints the raw input PDO bytes. Good for verifying that the bus works and PDOs are mapped correctly.
+
+### `beckhoff.py` — Beckhoff coupler + terminals
+
+Scans the bus, discovers all terminals behind an EK1100 coupler, and reads their inputs in a loop. Standard Beckhoff terminals use factory-default PDO mappings from the SII EEPROM, so no `ethercat_config.json` is needed.
+
+### `mixed_bus.py` — HDrive motor + Beckhoff terminals
+
+Demonstrates running an HDrive servo motor alongside Beckhoff I/O terminals on the same bus. Requires `pip install hdrive-etc`. The `HDriveETC` class is a slave handle that plugs into `EtherCATBus` just like `GenericSlave`, so you can combine any devices.
 
 ## API Overview
 
