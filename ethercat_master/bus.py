@@ -38,6 +38,7 @@ Bus discovery (no OP transition)::
 """
 
 import json
+import os
 import struct
 import threading
 import time
@@ -400,6 +401,12 @@ class EtherCATBus:
                 transition fails.
             ConfigurationError: If PDO mapping fails.
         """
+        if os.name != "nt" and os.geteuid() != 0:
+            raise PermissionError(
+                "EtherCAT requires raw socket access. "
+                "Please run with sudo: sudo python your_script.py"
+            )
+
         adapter = self._resolve_adapter(self.adapter)
         print(f"[BUS] Connecting to: {adapter.name}")
 

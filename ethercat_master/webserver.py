@@ -355,6 +355,13 @@ def main():
                         help="Path to ethercat_config.json")
     args = parser.parse_args()
 
+    import os
+    if os.name != "nt" and os.geteuid() != 0:
+        print("\n  Error: EtherCAT requires raw socket access.")
+        print("  Please run with sudo:\n")
+        print("    sudo ecmaster-web\n")
+        raise SystemExit(1)
+
     pdo_path = args.pdo_config
     if not pdo_path:
         candidate = Path(__file__).parent / "ethercat_config.json"
