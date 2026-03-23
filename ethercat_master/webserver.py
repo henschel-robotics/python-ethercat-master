@@ -100,17 +100,34 @@ class BusState:
         return 0
 
     def connect(self, adapter_name, cycle_time_ms):
+        from .slave import GenericSlave
+
         with self._lock:
             if self.bus and self.bus.master and self.bus.master.in_op:
                 raise RuntimeError("Already in OP. Stop first.")
             self.last_error = ""
             self.adapter_name = adapter_name
             self.cycle_time_ms = cycle_time_ms
+
+            slaves_info = EtherCATBus.discover(
+                adapter=adapter_name,
+                pdo_config_path=self.pdo_config_path,
+            )
+
             self.bus = EtherCATBus(
                 adapter=adapter_name,
                 cycle_time_ms=cycle_time_ms,
                 pdo_config_path=self.pdo_config_path,
             )
+
+            for s in slaves_info:
+                if s["input_bytes"] > 0 or s["output_bytes"] > 0:
+                    has_custom_pdo = False
+                    if self.bus.pdo_config and s["index"] in self.bus.pdo_config:
+                        has_custom_pdo = True
+                    handle = GenericSlave(s["index"], use_default_pdo=not has_custom_pdo)
+                    self.bus.register_slave(handle)
+
             self.bus.open()
             _save_net_config(self.pdo_config_path, adapter_name, cycle_time_ms)
 
@@ -301,7 +318,7 @@ class _Handler(BaseHTTPRequestHandler):
                     bus_state.cycle_time_ms = float(net.get("cycle_ms", bus_state.cycle_time_ms))
 
                 p.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
-                self._send_json({"ok": True})
+                self._send_json({"ok": True, "path": str(p.resolve())})
             except Exception as exc:
                 self._send_json({"error": str(exc)})
             return

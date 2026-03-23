@@ -244,6 +244,21 @@ class EtherCATBus:
                 info["available_rx_pdo"] = avail_rx
                 info["available_tx_pdo"] = avail_tx
 
+                has_io = info["input_bytes"] > 0 or info["output_bytes"] > 0
+                no_coe = not avail_rx and not avail_tx
+                if has_io and no_coe:
+                    info["sii_only"] = True
+                    if info["output_bytes"] > 0 and not avail_rx:
+                        sii_rx = {"pdo_index": "0x1600",
+                                  "objects": [f"SII default ({info['output_bytes']}B)"]}
+                        info["available_rx_pdo"] = [sii_rx]
+                        info["rx_pdo"] = [sii_rx]
+                    if info["input_bytes"] > 0 and not avail_tx:
+                        sii_tx = {"pdo_index": "0x1A00",
+                                  "objects": [f"SII default ({info['input_bytes']}B)"]}
+                        info["available_tx_pdo"] = [sii_tx]
+                        info["tx_pdo"] = [sii_tx]
+
                 slaves.append(info)
         finally:
             master.close()

@@ -71,8 +71,9 @@ def load_pdo_config(path):
 def get_slave_pdo(pdo_config, slave_index, default_rx=None, default_tx=None):
     """Look up (rx_pdo, tx_pdo) lists for a slave index.
 
-    Falls back to the ``"default"`` key, then to the provided defaults
-    (or ``DEFAULT_RX_PDO`` / ``DEFAULT_TX_PDO``).
+    Falls back to the ``"default"`` key, then to the provided defaults.
+    If no defaults are given and no config entry exists, returns empty
+    lists so that ``configure_pdo_mapping`` skips unconfigured SMs.
 
     Returns:
         tuple[list[int], list[int]]: (rx_pdo, tx_pdo) index lists.
@@ -81,20 +82,23 @@ def get_slave_pdo(pdo_config, slave_index, default_rx=None, default_tx=None):
         entry = pdo_config.get(slave_index, pdo_config.get("default"))
         if entry:
             return entry["rx_pdo"], entry["tx_pdo"]
-    return list(default_rx or DEFAULT_RX_PDO), list(default_tx or DEFAULT_TX_PDO)
+    return list(default_rx or []), list(default_tx or [])
 
 
 def configure_pdo_mapping(slave, rx_pdo=None, tx_pdo=None):
     """Write SDO objects to configure PDO mapping on *slave*.
 
     Writes the SyncManager 2 (0x1C12, RxPDO) and SyncManager 3
-    (0x1C13, TxPDO) assignment lists.
+    (0x1C13, TxPDO) assignment lists.  Silently skips a SyncManager
+    if the slave does not support it (e.g. input-only devices have no SM2).
 
     Args:
         slave: A pysoem slave object (in PRE-OP or higher).
         rx_pdo: List of RxPDO indices to assign to SM2 (master -> slave).
+            Pass an empty list to skip RxPDO configuration.
             Defaults to ``DEFAULT_RX_PDO``.
         tx_pdo: List of TxPDO indices to assign to SM3 (slave -> master).
+            Pass an empty list to skip TxPDO configuration.
             Defaults to ``DEFAULT_TX_PDO``.
     """
     if rx_pdo is None:
@@ -115,15 +119,27 @@ def configure_pdo_mapping(slave, rx_pdo=None, tx_pdo=None):
                 f"0x{index:04X}:0x{subindex:02X} {label} — {exc}"
             ) from exc
 
-    _sdo_write(0x1C12, 0x00, struct.pack("<B", 0), "clear SM2 RxPDO count")
-    _sdo_write(0x1C13, 0x00, struct.pack("<B", 0), "clear SM3 TxPDO count")
+    def _try_sdo_write(index, subindex, data, label=""):
+        try:
+            slave.sdo_write(index, subindex, data)
+            return True
+        except Exception:
+            return False
 
-    for i, pdo in enumerate(rx_pdo, start=1):
-        _sdo_write(0x1C12, i, struct.pack("<H", pdo), f"RxPDO[{i}]=0x{pdo:04X}")
-    _sdo_write(0x1C12, 0x00, struct.pack("<B", len(rx_pdo)),
-               f"set SM2 RxPDO count={len(rx_pdo)}")
+    if rx_pdo:
+        if _try_sdo_write(0x1C12, 0x00, struct.pack("<B", 0), "clear SM2 RxPDO count"):
+            for i, pdo in enumerate(rx_pdo, start=1):
+                _sdo_write(0x1C12, i, struct.pack("<H", pdo), f"RxPDO[{i}]=0x{pdo:04X}")
+            _sdo_write(0x1C12, 0x00, struct.pack("<B", len(rx_pdo)),
+                       f"set SM2 RxPDO count={len(rx_pdo)}")
+        else:
+            print(f"[PDO] {name}: SM2 (RxPDO) not supported, skipping")
 
-    for i, pdo in enumerate(tx_pdo, start=1):
-        _sdo_write(0x1C13, i, struct.pack("<H", pdo), f"TxPDO[{i}]=0x{pdo:04X}")
-    _sdo_write(0x1C13, 0x00, struct.pack("<B", len(tx_pdo)),
-               f"set SM3 TxPDO count={len(tx_pdo)}")
+    if tx_pdo:
+        if _try_sdo_write(0x1C13, 0x00, struct.pack("<B", 0), "clear SM3 TxPDO count"):
+            for i, pdo in enumerate(tx_pdo, start=1):
+                _sdo_write(0x1C13, i, struct.pack("<H", pdo), f"TxPDO[{i}]=0x{pdo:04X}")
+            _sdo_write(0x1C13, 0x00, struct.pack("<B", len(tx_pdo)),
+                       f"set SM3 TxPDO count={len(tx_pdo)}")
+        else:
+            print(f"[PDO] {name}: SM3 (TxPDO) not supported, skipping")

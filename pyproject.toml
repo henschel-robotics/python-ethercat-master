@@ -4,12 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ethercat-master"
-version = "0.1.2"
+version = "0.1.4"
 description = "Generic EtherCAT master library built on PySOEM — bus management, PDO mapping, slave discovery"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.8"
 authors = [
+    {name = "Henschel Robotics GmbH", email = "info@henschel-robotics.ch"},
+]
+maintainers = [
     {name = "Henschel Robotics GmbH", email = "info@henschel-robotics.ch"},
 ]
 keywords = ["ethercat", "pysoem", "fieldbus", "motion-control", "industrial", "automation"]
@@ -38,7 +41,9 @@ ecmaster-web = "ethercat_master.webserver:main"
 
 [project.urls]
 Homepage = "https://henschel-robotics.ch"
+Documentation = "https://henschel-robotics.ch"
 Repository = "https://github.com/henschel-robotics/python-ethercat-master"
+Issues = "https://github.com/henschel-robotics/python-ethercat-master/issues"
 
 [project.optional-dependencies]
 dev = [
