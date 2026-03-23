@@ -249,32 +249,29 @@ function savePdoConfig() {
     fetch(host+"api/pdo_config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)})
     .then(function(r){return r.json();}).then(function(d){
         if (d.error) { if(statusEl) statusEl.innerHTML="<span style='color:var(--danger)'>"+d.error+"</span>"; return; }
-        if (_busState === "OP") {
-            if(statusEl) statusEl.innerHTML="<span style='color:var(--accent)'>Saved. Reconnecting...</span>";
-            saveAndReconnect(statusEl);
-        } else {
-            if(statusEl) statusEl.innerHTML="<span style='color:var(--accent)'>Saved. Scanning &amp; going OP...</span>";
-            saveAndReconnect(statusEl);
-        }
+        var pathInfo = d.path ? "<br><span style='color:var(--text-dim);font-size:10px'>Saved to: " + d.path + "</span>" : "";
+        if(statusEl) statusEl.innerHTML="<span style='color:var(--accent)'>Saved. Connecting...</span>" + pathInfo;
+        saveAndReconnect(statusEl, pathInfo);
     }).catch(function(e){ if(statusEl) statusEl.innerHTML="<span style='color:var(--danger)'>"+e+"</span>"; });
 }
 
-function saveAndReconnect(statusEl) {
+function saveAndReconnect(statusEl, pathInfo) {
+    pathInfo = pathInfo || "";
     var params = _selectedAdapter != null ? "?adapter="+encodeURIComponent(_selectedAdapter) : "";
     fetch(host+"api/disconnect").then(function(r){return r.json();})
     .then(function() {
         setBusState("IDLE", null, null);
-        if(statusEl) statusEl.innerHTML="<span style='color:var(--accent)'>Scanning bus...</span>";
+        if(statusEl) statusEl.innerHTML="<span style='color:var(--accent)'>Scanning bus...</span>" + pathInfo;
         return fetch(host+"api/discover"+params);
     })
     .then(function(r){return r.json();})
     .then(function(data) {
-        if (data.error) { if(statusEl) statusEl.innerHTML="<span style='color:var(--danger)'>Scan failed: "+data.error+"</span>"; return; }
-        if(statusEl) statusEl.innerHTML="<span style='color:var(--accent)'>Going OP...</span>";
+        if (data.error) { if(statusEl) statusEl.innerHTML="<span style='color:var(--danger)'>Scan failed: "+data.error+"</span>" + pathInfo; return; }
+        if(statusEl) statusEl.innerHTML="<span style='color:var(--accent)'>Going OP...</span>" + pathInfo;
         doGoOp();
-        if(statusEl) statusEl.innerHTML="<span style='color:var(--success)'>Done</span>";
+        if(statusEl) statusEl.innerHTML="<span style='color:var(--success)'>Done</span>" + pathInfo;
     })
-    .catch(function(e){ if(statusEl) statusEl.innerHTML="<span style='color:var(--danger)'>Reconnect failed: "+e+"</span>"; });
+    .catch(function(e){ if(statusEl) statusEl.innerHTML="<span style='color:var(--danger)'>Reconnect failed: "+e+"</span>" + pathInfo; });
 }
 
 // ---------- Bus Discovery ----------
@@ -299,7 +296,8 @@ function scanBus() {
             var txCb = pdoCheckboxes(s.index, "tx", s.available_tx_pdo, s.tx_pdo);
             var pdoHtml = "";
             if (rxCb || txCb) {
-                pdoHtml = "<details onclick='event.stopPropagation()' style='margin-top:8px'><summary style='font-size:11px;color:var(--text-dim)'>PDO Configuration</summary><div style='margin-top:6px'>"+rxCb+txCb+"</div></details>";
+                var siiNote = s.sii_only ? "<div style='font-size:10px;color:var(--text-dim);margin-bottom:4px'>This device uses fixed SII/EEPROM PDO mapping (no CoE). Configuration is read-only.</div>" : "";
+                pdoHtml = "<details onclick='event.stopPropagation()' style='margin-top:8px'><summary style='font-size:11px;color:var(--text-dim)'>PDO Configuration</summary><div style='margin-top:6px'>"+siiNote+rxCb+txCb+"</div></details>";
             }
             html += "<div class='net-disc-slave' style='padding:10px 14px;border-top:1px solid var(--border)'>" +
                 "<div style='display:flex;align-items:center;gap:10px'>" +
