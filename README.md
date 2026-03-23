@@ -177,13 +177,23 @@ Or use the web interface to scan the bus, select PDOs with checkboxes, and save.
 
 ## Web Interface
 
-Start the built-in web server:
+Start the built-in web server using the **console script** (after `pip install ethercat-master`):
 
 ```bash
 sudo ecmaster-web
 sudo ecmaster-web --port 8080
 sudo ecmaster-web --pdo-config /path/to/ethercat_config.json
 ```
+
+Or run the same entry point as a **module** (useful in venvs, CI, or when `ecmaster-web` is not on `PATH`):
+
+```bash
+sudo python -m ethercat_master.webserver
+sudo python -m ethercat_master.webserver --port 8080
+sudo python -m ethercat_master.webserver --pdo-config /path/to/ethercat_config.json
+```
+
+On **Windows**, omit `sudo` (Npcap provides raw Ethernet access for the current user).
 
 Then open `http://localhost:8080` in your browser.
 
