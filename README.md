@@ -4,7 +4,7 @@ Generic EtherCAT master library built on [PySOEM](https://github.com/bnjmnp/pyso
 
 Developed by [Henschel Robotics GmbH](https://henschel-robotics.ch).
 
-![EtherCAT Master Web GUI](https://raw.githubusercontent.com/henschel-robotics/python-ethercat-master/main/docs/images/01-bus-overview.png)
+![EtherCAT Master Web GUI](https://raw.githubusercontent.com/henschel-robotics/python-ethercat-master/master/docs/images/01-bus-overview.png)
 
 ## Features
 
@@ -187,7 +187,7 @@ sudo ecmaster-web --pdo-config /path/to/ethercat_config.json
 
 Then open `http://localhost:8080` in your browser.
 
-![EtherCAT Master Web GUI](https://raw.githubusercontent.com/henschel-robotics/python-ethercat-master/main/docs/images/01-bus-overview.png)
+![EtherCAT Master Web GUI](https://raw.githubusercontent.com/henschel-robotics/python-ethercat-master/master/docs/images/01-bus-overview.png)
 
 The web GUI lets you:
 
@@ -199,7 +199,7 @@ The web GUI lets you:
 
 | Mixed bus (Beckhoff + HDrive) | Network Latency Test |
 |---|---|
-| ![Mixed Bus](https://raw.githubusercontent.com/henschel-robotics/python-ethercat-master/main/docs/images/03-bus-discovery-mixed.png) | ![Network Test](https://raw.githubusercontent.com/henschel-robotics/python-ethercat-master/main/docs/images/02-network-test.png) |
+| ![Mixed Bus](https://raw.githubusercontent.com/henschel-robotics/python-ethercat-master/master/docs/images/03-bus-discovery-mixed.png) | ![Network Test](https://raw.githubusercontent.com/henschel-robotics/python-ethercat-master/master/docs/images/02-network-test.png) |
 
 > **Full guide:** [`docs/web-interface.md`](docs/web-interface.md)
 
