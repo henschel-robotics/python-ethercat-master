@@ -47,7 +47,13 @@ from pathlib import Path
 import pysoem
 
 from .exceptions import ConnectionError, CommunicationError, ConfigurationError
-from .pdo import configure_pdo_mapping, load_pdo_config, get_slave_pdo
+from .pdo import (
+    configure_pdo_mapping,
+    load_pdo_config,
+    get_slave_pdo,
+    pdo_mapping_exists,
+    sanitize_invalid_pdo_assignments,
+)
 
 
 _EC_STATES = {
@@ -67,6 +73,31 @@ def _state_name(state_code):
     if state_code & pysoem.STATE_ACK:
         name += "+ERR"
     return name
+
+
+def _on_slave_emergency(_emcy):
+    """CoE emergency handler so SDO traffic uses pysoem's callback path (not deprecated)."""
+    pass
+
+
+def register_emergency_callbacks(master):
+    """Attach an emergency callback to every slave on *master*.
+
+    PySOEM >= 1.1.8 routes mailbox emergencies through registered callbacks.
+    Without this, ``sdo_read`` / ``sdo_write`` emit a ``FutureWarning`` and may
+    raise :class:`pysoem.Emergency` when a slave sends an EMCY during CoE access.
+
+    Call this once per ``config_init()`` — ``CdefSlave`` is a Cython type
+    without ``__dict__`` or weakref support, so we can't dedupe across calls.
+    """
+    slaves = getattr(master, "slaves", None) or []
+    if not slaves or not hasattr(slaves[0], "add_emergency_callback"):
+        return
+    for slave in slaves:
+        try:
+            slave.add_emergency_callback(_on_slave_emergency)
+        except Exception:
+            pass
 
 
 class EtherCATBus:
@@ -214,10 +245,16 @@ class EtherCATBus:
                 master.close()
                 return []
 
+            register_emergency_callbacks(master)
+
             for i, slave in enumerate(master.slaves):
                 try:
                     rx, tx = get_slave_pdo(pdo_config, i)
                     configure_pdo_mapping(slave, rx_pdo=rx, tx_pdo=tx)
+                except Exception:
+                    pass
+                try:
+                    sanitize_invalid_pdo_assignments(slave)
                 except Exception:
                     pass
 
@@ -249,13 +286,17 @@ class EtherCATBus:
                 if has_io and no_coe:
                     info["sii_only"] = True
                     if info["output_bytes"] > 0 and not avail_rx:
-                        sii_rx = {"pdo_index": "0x1600",
-                                  "objects": [f"SII default ({info['output_bytes']}B)"]}
+                        sii_rx = {
+                            "pdo_index": "SII",
+                            "objects": [f"EEPROM default ({info['output_bytes']}B)"],
+                        }
                         info["available_rx_pdo"] = [sii_rx]
                         info["rx_pdo"] = [sii_rx]
                     if info["input_bytes"] > 0 and not avail_tx:
-                        sii_tx = {"pdo_index": "0x1A00",
-                                  "objects": [f"SII default ({info['input_bytes']}B)"]}
+                        sii_tx = {
+                            "pdo_index": "SII",
+                            "objects": [f"EEPROM default ({info['input_bytes']}B)"],
+                        }
                         info["available_tx_pdo"] = [sii_tx]
                         info["tx_pdo"] = [sii_tx]
 
@@ -303,6 +344,9 @@ class EtherCATBus:
                 raw = slave.sdo_read(sm_index, sub, 2)
                 pdo_idx = struct.unpack("<H", raw[:2])[0]
             except Exception:
+                continue
+
+            if pdo_idx and not pdo_mapping_exists(slave, pdo_idx):
                 continue
 
             pdo_entry = {"pdo_index": f"0x{pdo_idx:04X}", "objects": []}
@@ -433,6 +477,8 @@ class EtherCATBus:
         if self.master.config_init() <= 0:
             raise ConnectionError("No EtherCAT slaves found")
 
+        register_emergency_callbacks(self.master)
+
         print(f"[BUS] Found {len(self.master.slaves)} EtherCAT slave(s)")
 
         for slave in self.master.slaves:
@@ -451,6 +497,12 @@ class EtherCATBus:
                     raise ConfigurationError(
                         f"PDO mapping failed for slave {handle.slave_index}: {exc}"
                     ) from exc
+
+        for slave in self.master.slaves:
+            try:
+                sanitize_invalid_pdo_assignments(slave)
+            except Exception:
+                pass
 
         try:
             self.master.config_map()
@@ -742,6 +794,8 @@ class EtherCATBus:
                 if self.master.config_init() <= 0:
                     raise CommunicationError("No EtherCAT slaves found")
 
+                register_emergency_callbacks(self.master)
+
                 for slave in self.master.slaves:
                     slave.is_lost = False
 
@@ -750,6 +804,12 @@ class EtherCATBus:
                         rx, tx = get_slave_pdo(self.pdo_config, handle.slave_index)
                         handle.configure(self.master.slaves[handle.slave_index],
                                          rx_pdo=rx, tx_pdo=tx)
+
+                for slave in self.master.slaves:
+                    try:
+                        sanitize_invalid_pdo_assignments(slave)
+                    except Exception:
+                        pass
 
                 self.master.config_map()
 

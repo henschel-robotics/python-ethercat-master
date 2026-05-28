@@ -25,15 +25,16 @@ Bus discovery::
 :license: MIT
 """
 
-from .bus import EtherCATBus
+from .bus import EtherCATBus, register_emergency_callbacks
 from .slave import GenericSlave
 from .pdo import load_pdo_config, get_slave_pdo, configure_pdo_mapping
 from .exceptions import EtherCATError, ConnectionError, CommunicationError, ConfigurationError
 from .network_test import NetworkLatencyTest
 
-__version__ = "0.1.0"
+__version__ = "0.1.5"
 __all__ = [
     "EtherCATBus",
+    "register_emergency_callbacks",
     "GenericSlave",
     "NetworkLatencyTest",
     "load_pdo_config",

@@ -235,10 +235,12 @@ function savePdoConfig() {
     _discoveredSlaves.forEach(function(s) {
         var rx=[], tx=[];
         (s.available_rx_pdo||[]).forEach(function(p){
+            if (!/^0x[0-9A-Fa-f]+$/i.test(p.pdo_index)) return;
             var cb = byId("pdoCb_"+s.index+"_rx_"+p.pdo_index);
             if (cb && cb.checked) rx.push(p.pdo_index);
         });
         (s.available_tx_pdo||[]).forEach(function(p){
+            if (!/^0x[0-9A-Fa-f]+$/i.test(p.pdo_index)) return;
             var cb = byId("pdoCb_"+s.index+"_tx_"+p.pdo_index);
             if (cb && cb.checked) tx.push(p.pdo_index);
         });

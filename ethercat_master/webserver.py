@@ -123,8 +123,10 @@ class BusState:
             for s in slaves_info:
                 if s["input_bytes"] > 0 or s["output_bytes"] > 0:
                     has_custom_pdo = False
-                    if self.bus.pdo_config and s["index"] in self.bus.pdo_config:
-                        has_custom_pdo = True
+                    if self.bus.pdo_config:
+                        entry = self.bus.pdo_config.get(s["index"])
+                        if entry and (entry["rx_pdo"] or entry["tx_pdo"]):
+                            has_custom_pdo = True
                     handle = GenericSlave(s["index"], use_default_pdo=not has_custom_pdo)
                     self.bus.register_slave(handle)
 

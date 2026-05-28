@@ -14,6 +14,87 @@ from pathlib import Path
 DEFAULT_RX_PDO = [0x1600]
 DEFAULT_TX_PDO = [0x1A00]
 
+# Beckhoff EL2574 (4-ch pixel LED output): process data is on RxPDO 0x1600 (SM2).
+# TxPDO 0x1A00 (status/diagnostics) is optional and may be absent depending on FW.
+EL2574_RX_PDO = [0x1600]
+
+
+def pdo_mapping_exists(slave, pdo_index):
+    """Return True if the PDO mapping object (0x160n / 0x1An0) exists in CoE."""
+    try:
+        slave.sdo_read(pdo_index, 0, 1)
+        return True
+    except Exception:
+        return False
+
+
+def filter_existing_pdos(slave, pdo_list, label="PDO"):
+    """Drop PDO indices that are not present in the slave object dictionary."""
+    name = getattr(slave, "name", "?")
+    if isinstance(name, bytes):
+        name = name.decode("utf-8", errors="replace")
+    existing = []
+    for pdo in pdo_list:
+        if pdo_mapping_exists(slave, pdo):
+            existing.append(pdo)
+        else:
+            print(
+                f"[PDO] {name}: skipping {label} 0x{pdo:04X} "
+                f"(not in object dictionary)"
+            )
+    return existing
+
+
+def read_assigned_pdos(slave, assign_index):
+    """Read PDO indices currently assigned to 0x1C12 (outputs) or 0x1C13 (inputs)."""
+    try:
+        raw = slave.sdo_read(assign_index, 0, 1)
+        n_pdos = raw[0] if raw else 0
+    except Exception:
+        return []
+
+    assigned = []
+    for sub in range(1, n_pdos + 1):
+        try:
+            raw = slave.sdo_read(assign_index, sub, 2)
+            assigned.append(struct.unpack("<H", raw[:2])[0])
+        except Exception:
+            continue
+    return assigned
+
+
+def clear_pdo_assignment(slave, assign_index):
+    """Set PDO assign object (0x1C12 / 0x1C13) count to zero."""
+    try:
+        slave.sdo_write(assign_index, 0, struct.pack("<B", 0))
+        return True
+    except Exception:
+        return False
+
+
+def sanitize_invalid_pdo_assignments(slave):
+    """Clear SM PDO assignments that reference missing mapping objects.
+
+    Beckhoff terminals may still have 0x1C13 -> 0x1A00 in EEPROM while the
+    0x1A00 mapping object is absent (e.g. EL2574 status PDO disabled). That
+    breaks PRE-OP / config_map unless the assignment is cleared.
+    """
+    name = getattr(slave, "name", "?")
+    if isinstance(name, bytes):
+        name = name.decode("utf-8", errors="replace")
+
+    for assign_index, label in ((0x1C12, "RxPDO"), (0x1C13, "TxPDO")):
+        assigned = read_assigned_pdos(slave, assign_index)
+        invalid = [p for p in assigned if p and not pdo_mapping_exists(slave, p)]
+        if not invalid:
+            continue
+        if clear_pdo_assignment(slave, assign_index):
+            indices = ", ".join(f"0x{p:04X}" for p in invalid)
+            print(
+                f"[PDO] {name}: cleared {label} assignment "
+                f"(missing mapping: {indices})"
+            )
+
 
 def load_pdo_config(path):
     """Load PDO mapping configuration from a JSON file.
@@ -85,7 +166,7 @@ def get_slave_pdo(pdo_config, slave_index, default_rx=None, default_tx=None):
     return list(default_rx or []), list(default_tx or [])
 
 
-def configure_pdo_mapping(slave, rx_pdo=None, tx_pdo=None):
+def configure_pdo_mapping(slave, rx_pdo=None, tx_pdo=None, use_defaults=False):
     """Write SDO objects to configure PDO mapping on *slave*.
 
     Writes the SyncManager 2 (0x1C12, RxPDO) and SyncManager 3
@@ -96,15 +177,30 @@ def configure_pdo_mapping(slave, rx_pdo=None, tx_pdo=None):
         slave: A pysoem slave object (in PRE-OP or higher).
         rx_pdo: List of RxPDO indices to assign to SM2 (master -> slave).
             Pass an empty list to skip RxPDO configuration.
-            Defaults to ``DEFAULT_RX_PDO``.
+            ``None`` with ``use_defaults=True`` uses ``DEFAULT_RX_PDO``;
+            otherwise ``None`` is treated as "do not change".
         tx_pdo: List of TxPDO indices to assign to SM3 (slave -> master).
             Pass an empty list to skip TxPDO configuration.
-            Defaults to ``DEFAULT_TX_PDO``.
+            ``None`` with ``use_defaults=True`` uses ``DEFAULT_TX_PDO``.
+        use_defaults: When True, ``None`` rx/tx lists fall back to
+            ``DEFAULT_RX_PDO`` / ``DEFAULT_TX_PDO``.  Bus discovery and
+            config-file driven setup pass explicit lists and leave this False.
     """
-    if rx_pdo is None:
-        rx_pdo = DEFAULT_RX_PDO
-    if tx_pdo is None:
-        tx_pdo = DEFAULT_TX_PDO
+    sanitize_invalid_pdo_assignments(slave)
+
+    if use_defaults:
+        if rx_pdo is None:
+            rx_pdo = list(DEFAULT_RX_PDO)
+        if tx_pdo is None:
+            tx_pdo = list(DEFAULT_TX_PDO)
+    else:
+        if rx_pdo is None:
+            rx_pdo = []
+        if tx_pdo is None:
+            tx_pdo = []
+
+    rx_pdo = filter_existing_pdos(slave, rx_pdo, label="RxPDO")
+    tx_pdo = filter_existing_pdos(slave, tx_pdo, label="TxPDO")
 
     name = getattr(slave, "name", "?")
     if isinstance(name, bytes):
