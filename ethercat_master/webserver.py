@@ -29,12 +29,14 @@ try:
     from .bus import EtherCATBus
     from .pdo import load_pdo_config, get_slave_pdo
     from .network_test import NetworkLatencyTest
+    from .slave import GenericSlave
 except ImportError:
     import sys as _sys
     _sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from ethercat_master.bus import EtherCATBus
     from ethercat_master.pdo import load_pdo_config, get_slave_pdo
     from ethercat_master.network_test import NetworkLatencyTest
+    from ethercat_master.slave import GenericSlave
 
 # ---------------------------------------------------------------------------
 # State
@@ -100,8 +102,6 @@ class BusState:
         return 0
 
     def connect(self, adapter_name, cycle_time_ms):
-        from .slave import GenericSlave
-
         with self._lock:
             if self.bus and self.bus.master and self.bus.master.in_op:
                 raise RuntimeError("Already in OP. Stop first.")

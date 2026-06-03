@@ -53,6 +53,7 @@ from .pdo import (
     get_slave_pdo,
     pdo_mapping_exists,
     sanitize_invalid_pdo_assignments,
+    slave_supports_coe_pdo_mapping,
 )
 
 
@@ -248,13 +249,14 @@ class EtherCATBus:
             register_emergency_callbacks(master)
 
             for i, slave in enumerate(master.slaves):
+                if not slave_supports_coe_pdo_mapping(slave):
+                    continue
                 try:
                     rx, tx = get_slave_pdo(pdo_config, i)
-                    configure_pdo_mapping(slave, rx_pdo=rx, tx_pdo=tx)
-                except Exception:
-                    pass
-                try:
-                    sanitize_invalid_pdo_assignments(slave)
+                    if rx or tx:
+                        configure_pdo_mapping(slave, rx_pdo=rx, tx_pdo=tx)
+                    else:
+                        sanitize_invalid_pdo_assignments(slave)
                 except Exception:
                     pass
 
@@ -288,17 +290,19 @@ class EtherCATBus:
                     if info["output_bytes"] > 0 and not avail_rx:
                         sii_rx = {
                             "pdo_index": "SII",
-                            "objects": [f"EEPROM default ({info['output_bytes']}B)"],
+                            "label": f"Fixed EEPROM mapping ({info['output_bytes']} B outputs)",
+                            "readonly": True,
+                            "objects": [],
                         }
                         info["available_rx_pdo"] = [sii_rx]
-                        info["rx_pdo"] = [sii_rx]
                     if info["input_bytes"] > 0 and not avail_tx:
                         sii_tx = {
                             "pdo_index": "SII",
-                            "objects": [f"EEPROM default ({info['input_bytes']}B)"],
+                            "label": f"Fixed EEPROM mapping ({info['input_bytes']} B inputs)",
+                            "readonly": True,
+                            "objects": [],
                         }
                         info["available_tx_pdo"] = [sii_tx]
-                        info["tx_pdo"] = [sii_tx]
 
                 slaves.append(info)
         finally:
@@ -499,6 +503,8 @@ class EtherCATBus:
                     ) from exc
 
         for slave in self.master.slaves:
+            if not slave_supports_coe_pdo_mapping(slave):
+                continue
             try:
                 sanitize_invalid_pdo_assignments(slave)
             except Exception:
@@ -806,6 +812,8 @@ class EtherCATBus:
                                          rx_pdo=rx, tx_pdo=tx)
 
                 for slave in self.master.slaves:
+                    if not slave_supports_coe_pdo_mapping(slave):
+                        continue
                     try:
                         sanitize_invalid_pdo_assignments(slave)
                     except Exception:

@@ -1,6 +1,6 @@
 {
   "network": {
-    "adapter": "\\Device\\NPF_{BB3EC489-F999-4A9B-9345-B5254A25CCC2}",
+    "adapter": "\\Device\\NPF_{203B6804-9012-4C61-8ACB-AF3C88B8BB91}",
     "cycle_ms": 0.1
   },
   "default": {},
@@ -13,19 +13,29 @@
       "rx_pdo": [
         "0x1600"
       ],
-      "tx_pdo": []
+      "tx_pdo": [
+        "0x1A00"
+      ]
     },
     "2": {
       "rx_pdo": [
         "0x1600"
       ],
-      "tx_pdo": []
+      "tx_pdo": [
+        "0x1A00"
+      ]
     },
     "3": {
+      "rx_pdo": [],
+      "tx_pdo": []
+    },
+    "4": {
       "rx_pdo": [
         "0x1600"
       ],
-      "tx_pdo": []
+      "tx_pdo": [
+        "0x1A00"
+      ]
     }
   }
 }

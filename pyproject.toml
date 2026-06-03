@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ethercat-master"
-version = "0.1.5"
+version = "0.1.6"
 description = "Generic EtherCAT master library built on PySOEM — bus management, PDO mapping, slave discovery"
 readme = "README.md"
 license = {text = "MIT"}

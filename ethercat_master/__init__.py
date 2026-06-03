@@ -31,7 +31,7 @@ from .pdo import load_pdo_config, get_slave_pdo, configure_pdo_mapping
 from .exceptions import EtherCATError, ConnectionError, CommunicationError, ConfigurationError
 from .network_test import NetworkLatencyTest
 
-__version__ = "0.1.5"
+__version__ = "0.1.6"
 __all__ = [
     "EtherCATBus",
     "register_emergency_callbacks",

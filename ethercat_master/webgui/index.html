@@ -202,9 +202,14 @@ function doStop() {
 // ---------- PDO helpers ----------
 
 function pdoLabel(p) {
+    if (p.label) return p.label;
     var lbl = p.pdo_index;
     if (p.objects && p.objects.length) {
-        lbl += ": " + p.objects.map(function(o){return o.index+":"+o.subindex+" ("+o.bits+"b)";}).join(", ");
+        lbl += ": " + p.objects.map(function(o) {
+            if (typeof o === "string") return o;
+            if (o && o.index !== undefined) return o.index + ":" + o.subindex + " (" + o.bits + "b)";
+            return String(o);
+        }).join(", ");
     }
     return lbl;
 }
@@ -216,6 +221,10 @@ function pdoCheckboxes(slaveIdx, dir, availList, assignedList) {
     var label = dir==="rx" ? "RxPDO (Master &rarr; Slave)" : "TxPDO (Slave &rarr; Master)";
     var h = "<div style='font-size:10px;font-weight:600;color:var(--text-dim);margin-bottom:2px;margin-top:6px'>"+label+"</div>";
     availList.forEach(function(p) {
+        if (p.readonly || p.pdo_index === "SII") {
+            h += "<div style='padding:2px 0 2px 8px;font-size:11px;color:var(--text-faint)'>" + pdoLabel(p) + "</div>";
+            return;
+        }
         var id = "pdoCb_"+slaveIdx+"_"+dir+"_"+p.pdo_index;
         var chk = assigned[p.pdo_index] ? " checked" : "";
         h += "<label style='display:flex;align-items:flex-start;gap:6px;padding:2px 0 2px 8px;font-size:11px;color:var(--text-faint);cursor:pointer'><input type='checkbox' id='"+id+"'"+chk+" style='margin-top:2px'><span>"+pdoLabel(p)+"</span></label>";

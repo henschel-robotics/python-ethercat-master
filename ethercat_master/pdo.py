@@ -28,6 +28,21 @@ def pdo_mapping_exists(slave, pdo_index):
         return False
 
 
+def slave_supports_coe_pdo_mapping(slave):
+    """Return True if the slave exposes configurable CoE PDO mapping objects.
+
+    Simple terminals (e.g. EL1808) use fixed SII/EEPROM process data only; they
+    have no 0x1600/0x1A00 mapping entries and must not be sanitized via CoE.
+    """
+    for idx in range(0x1600, 0x1610):
+        if pdo_mapping_exists(slave, idx):
+            return True
+    for idx in range(0x1A00, 0x1A10):
+        if pdo_mapping_exists(slave, idx):
+            return True
+    return False
+
+
 def filter_existing_pdos(slave, pdo_list, label="PDO"):
     """Drop PDO indices that are not present in the slave object dictionary."""
     name = getattr(slave, "name", "?")
@@ -78,7 +93,13 @@ def sanitize_invalid_pdo_assignments(slave):
     Beckhoff terminals may still have 0x1C13 -> 0x1A00 in EEPROM while the
     0x1A00 mapping object is absent (e.g. EL2574 status PDO disabled). That
     breaks PRE-OP / config_map unless the assignment is cleared.
+
+    Skipped on SII-only devices (e.g. EL1808): their process data is fixed in
+    EEPROM and assignment objects are not visible in CoE.
     """
+    if not slave_supports_coe_pdo_mapping(slave):
+        return
+
     name = getattr(slave, "name", "?")
     if isinstance(name, bytes):
         name = name.decode("utf-8", errors="replace")
@@ -186,6 +207,9 @@ def configure_pdo_mapping(slave, rx_pdo=None, tx_pdo=None, use_defaults=False):
             ``DEFAULT_RX_PDO`` / ``DEFAULT_TX_PDO``.  Bus discovery and
             config-file driven setup pass explicit lists and leave this False.
     """
+    if not slave_supports_coe_pdo_mapping(slave):
+        return
+
     sanitize_invalid_pdo_assignments(slave)
 
     if use_defaults:
