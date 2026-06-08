@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ethercat-master"
-version = "0.1.6"
+version = "0.1.7"
 description = "Generic EtherCAT master library built on PySOEM — bus management, PDO mapping, slave discovery"
 readme = "README.md"
 license = {text = "MIT"}
@@ -49,6 +49,8 @@ Issues = "https://github.com/henschel-robotics/python-ethercat-master/issues"
 dev = [
     "pytest>=7.0",
     "ruff>=0.1.0",
+    "build>=1.0",
+    "twine>=5.0",
 ]
 
 [tool.setuptools.packages.find]
