@@ -51,9 +51,12 @@ from .pdo import (
     configure_pdo_mapping,
     load_pdo_config,
     get_slave_pdo,
+    get_slave_startup,
+    apply_startup_sdos,
     pdo_mapping_exists,
     sanitize_invalid_pdo_assignments,
     slave_supports_coe_pdo_mapping,
+    slave_supports_pdo_assignment,
 )
 
 
@@ -249,16 +252,30 @@ class EtherCATBus:
             register_emergency_callbacks(master)
 
             for i, slave in enumerate(master.slaves):
-                if not slave_supports_coe_pdo_mapping(slave):
+                name = slave.name if isinstance(slave.name, str) else \
+                    slave.name.decode("utf-8", errors="replace")
+                apply_startup_sdos(slave, get_slave_startup(pdo_config, i),
+                                   "IP", name=f"[{i}] {name}")
+
+            for i, slave in enumerate(master.slaves):
+                supports_mapping = slave_supports_coe_pdo_mapping(slave)
+                supports_assign = slave_supports_pdo_assignment(slave)
+                if not (supports_mapping or supports_assign):
                     continue
                 try:
                     rx, tx = get_slave_pdo(pdo_config, i)
                     if rx or tx:
                         configure_pdo_mapping(slave, rx_pdo=rx, tx_pdo=tx)
-                    else:
+                    elif supports_mapping:
                         sanitize_invalid_pdo_assignments(slave)
                 except Exception:
                     pass
+
+            for i, slave in enumerate(master.slaves):
+                name = slave.name if isinstance(slave.name, str) else \
+                    slave.name.decode("utf-8", errors="replace")
+                apply_startup_sdos(slave, get_slave_startup(pdo_config, i),
+                                   "PS", name=f"[{i}] {name}")
 
             master.config_map()
 
@@ -488,6 +505,9 @@ class EtherCATBus:
         for slave in self.master.slaves:
             slave.is_lost = False
 
+        # CoE Init->PreOP startup writes (e.g. EL2574 revision/diag) before mapping.
+        self._apply_startup_sdos("IP")
+
         with self._lock:
             for handle in self._slaves:
                 try:
@@ -502,6 +522,31 @@ class EtherCATBus:
                         f"PDO mapping failed for slave {handle.slave_index}: {exc}"
                     ) from exc
 
+        # Slaves with no registered handle (e.g. web UI omits 0‑byte devices after
+        # discover) still need CoE PDO mapping from get_slave_pdo / ethercat_config.
+        registered = {h.slave_index for h in self._slaves}
+        for idx, slave in enumerate(self.master.slaves):
+            if idx in registered:
+                continue
+            try:
+                rx, tx = get_slave_pdo(self.pdo_config, idx)
+                if not (rx or tx):
+                    continue
+                if not (slave_supports_coe_pdo_mapping(slave)
+                        or slave_supports_pdo_assignment(slave)):
+                    continue
+                configure_pdo_mapping(slave, rx_pdo=rx, tx_pdo=tx)
+                print(
+                    f"[BUS] Slave {idx}: "
+                    f"configured RxPDO={[f'0x{p:04X}' for p in (rx or [])]} "
+                    f"TxPDO={[f'0x{p:04X}' for p in (tx or [])]} "
+                    f"(pdo_config, no handle)"
+                )
+            except Exception as exc:
+                raise ConfigurationError(
+                    f"PDO mapping failed for slave {idx}: {exc}"
+                ) from exc
+
         for slave in self.master.slaves:
             if not slave_supports_coe_pdo_mapping(slave):
                 continue
@@ -509,6 +554,10 @@ class EtherCATBus:
                 sanitize_invalid_pdo_assignments(slave)
             except Exception:
                 pass
+
+        # CoE PreOP->SafeOP startup writes (e.g. EL2574 0xF030 slot config) after
+        # the PDO assignment and before config_map() so process data is sized.
+        self._apply_startup_sdos("PS")
 
         try:
             self.master.config_map()
@@ -555,6 +604,7 @@ class EtherCATBus:
     _AL_STATUS_CODES = {
         0x0000: "No error",
         0x0001: "Unspecified error",
+        0x0003: "Invalid device setup (modular: 0xF030 != detected 0xF050)",
         0x0011: "Invalid requested state change",
         0x0012: "Unknown requested state",
         0x0013: "Bootstrap not supported",
@@ -603,11 +653,54 @@ class EtherCATBus:
         0x0051: "EEPROM error",
         0x0060: "Slave restarted locally",
         0x0061: "Device identification value updated",
+        0x0070: "Invalid module configuration (0xF030 != 0xF050)",
         0x00F0: "Application controller available",
     }
 
+    def _apply_startup_sdos(self, transition):
+        """Apply configured CoE startup SDO writes for the given transition.
+
+        *transition* is ``"IP"`` (Init->PreOP) or ``"PS"`` (PreOP->SafeOP).
+        Mirrors the TwinCAT Startup tab; needed for modular terminals such as
+        the EL2574 (0xF030 slot config).
+        """
+        if not self.pdo_config:
+            return
+        for idx, slave in enumerate(self.master.slaves):
+            entries = get_slave_startup(self.pdo_config, idx)
+            if not entries:
+                continue
+            name = slave.name if isinstance(slave.name, str) else \
+                slave.name.decode("utf-8", errors="replace")
+            apply_startup_sdos(slave, entries, transition, name=f"[{idx}] {name}")
+
+    @staticmethod
+    def _read_al_status_code(slave):
+        """Read the ESC AL Status Code register (0x0134) for a slave.
+
+        Fallback when pysoem's ``al_status`` attribute is empty. Returns the
+        16-bit code, or ``None`` if the register read is unavailable.
+        """
+        reader = getattr(slave, "read_reg", None) or getattr(slave, "fprd", None)
+        if reader is None:
+            return None
+        try:
+            raw = reader(0x0134, 2)
+            if raw and len(raw) >= 2:
+                return struct.unpack("<H", bytes(raw[:2]))[0]
+        except Exception:
+            return None
+        return None
+
     def _slave_state_report(self):
         """Build a detailed diagnostic string for each slave."""
+        # Refresh .state / .al_status from the slaves; pysoem only populates
+        # al_status after an explicit read_state(), otherwise it reports N/A.
+        try:
+            self.master.read_state()
+        except Exception:
+            pass
+
         lines = []
         for i, slave in enumerate(self.master.slaves):
             state = _state_name(slave.state)
@@ -616,6 +709,8 @@ class EtherCATBus:
                 name = name.decode("utf-8", errors="replace")
 
             al_status = getattr(slave, "al_status", None)
+            if not al_status:
+                al_status = self._read_al_status_code(slave)
             al_hex = f"0x{al_status:04X}" if al_status else "N/A"
             al_text = self._AL_STATUS_CODES.get(al_status, "Unknown") if al_status else ""
 
@@ -805,11 +900,30 @@ class EtherCATBus:
                 for slave in self.master.slaves:
                     slave.is_lost = False
 
+                self._apply_startup_sdos("IP")
+
                 with self._lock:
                     for handle in self._slaves:
                         rx, tx = get_slave_pdo(self.pdo_config, handle.slave_index)
                         handle.configure(self.master.slaves[handle.slave_index],
                                          rx_pdo=rx, tx_pdo=tx)
+
+                registered = {h.slave_index for h in self._slaves}
+                for idx, slave in enumerate(self.master.slaves):
+                    if idx in registered:
+                        continue
+                    try:
+                        rx, tx = get_slave_pdo(self.pdo_config, idx)
+                        if not (rx or tx):
+                            continue
+                        if not (slave_supports_coe_pdo_mapping(slave)
+                                or slave_supports_pdo_assignment(slave)):
+                            continue
+                        configure_pdo_mapping(slave, rx_pdo=rx, tx_pdo=tx)
+                    except Exception as exc:
+                        raise CommunicationError(
+                            f"PDO mapping failed for slave {idx}: {exc}"
+                        ) from exc
 
                 for slave in self.master.slaves:
                     if not slave_supports_coe_pdo_mapping(slave):
@@ -818,6 +932,8 @@ class EtherCATBus:
                         sanitize_invalid_pdo_assignments(slave)
                     except Exception:
                         pass
+
+                self._apply_startup_sdos("PS")
 
                 self.master.config_map()
 
