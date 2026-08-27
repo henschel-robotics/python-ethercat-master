@@ -12,7 +12,7 @@ Architecture
 
     EtherCATBus
     ├── pysoem.Master          (adapter handle)
-    ├── ProcessData thread     (1 ms — raw frame send/receive)
+    ├── ProcessData thread     (default 1 ms — raw frame send/receive, configurable)
     ├── PDO Update thread      (configurable — decode RX, encode TX per slave)
     └── State Check thread     (300 ms — health monitoring, auto-reconnect)
 
@@ -37,6 +37,8 @@ Bus discovery (no OP transition)::
 
 """
 
+import ctypes
+import inspect as _inspect
 import json
 import os
 import struct
@@ -104,6 +106,49 @@ def register_emergency_callbacks(master):
             pass
 
 
+# ------------------------------------------------------------------------------
+# High-resolution timing (sub-millisecond) helpers
+# ------------------------------------------------------------------------------
+def _switch_to_other_thread():
+    """Yield the current time slice if an OS API is available.
+
+    Uses SwitchToThread on Windows and os.sched_yield on POSIX.
+    """
+    if hasattr(ctypes, "windll") and ctypes.windll:
+        ctypes.windll.kernel32.SwitchToThread()
+    else:
+        try:
+            os.sched_yield()
+        except (AttributeError, OSError):
+            pass
+
+
+def _wait_deadline(deadline):
+    """Wait until *deadline* (seconds from perf_counter).
+
+    For the final millisecond before the deadline we busy-wait with voluntary
+    yields to get sub-millisecond precision.  For longer waits we use
+    time.sleep() to avoid wasting CPU.
+    """
+    while True:
+        remaining = deadline - time.perf_counter()
+        if remaining <= 0:
+            return
+        if remaining > 0.002:
+            time.sleep(remaining - 0.001)
+        else:
+            _switch_to_other_thread()
+
+
+# Detect whether this pysoem build supports release_gil= on the PDO calls.
+_SEND_PD_KWARGS = {}
+_RECV_PD_KWARGS = {}
+if "release_gil" in _inspect.signature(pysoem.Master.send_processdata).parameters:
+    _SEND_PD_KWARGS["release_gil"] = True
+if "release_gil" in _inspect.signature(pysoem.Master.receive_processdata).parameters:
+    _RECV_PD_KWARGS["release_gil"] = True
+
+
 class EtherCATBus:
     """Manage an EtherCAT bus with one or more slaves.
 
@@ -117,12 +162,17 @@ class EtherCATBus:
             ``\\Device\\NPF_{GUID}``).  Use :meth:`list_adapters` to
             enumerate available adapters and their names.
         cycle_time_ms: PDO update cycle time in milliseconds.
+        processdata_cycle_ms: Raw EtherCAT send/receive cycle in
+            milliseconds.  Defaults to 1 ms when omitted, preserving the
+            previous behaviour.  Set this to the desired bus frequency
+            (e.g. 0.714 for ~1400 Hz) independently of *cycle_time_ms*.
         pdo_config_path: Optional path to an ``ethercat_config.json`` file.
             When provided, per-slave PDO assignments are read from
             this file instead of using the hardcoded defaults.
     """
 
-    def __init__(self, adapter=None, cycle_time_ms=10, pdo_config_path=None):
+    def __init__(self, adapter=None, cycle_time_ms=10, processdata_cycle_ms=None,
+                 pdo_config_path=None):
         if pdo_config_path:
             self.pdo_config = load_pdo_config(pdo_config_path)
             net = self._read_network_config(pdo_config_path)
@@ -130,11 +180,16 @@ class EtherCATBus:
                 adapter = net["adapter"]
             if cycle_time_ms == 10 and net.get("cycle_ms"):
                 cycle_time_ms = net["cycle_ms"]
+            if processdata_cycle_ms is None and net.get("processdata_cycle_ms"):
+                processdata_cycle_ms = net["processdata_cycle_ms"]
         else:
             self.pdo_config = None
 
         self.adapter = adapter
         self.cycle_time = cycle_time_ms / 1000.0
+        self.processdata_cycle_time = (processdata_cycle_ms / 1000.0
+                                       if processdata_cycle_ms is not None
+                                       else 0.001)
 
         self.master = None
         self._slaves = []
@@ -760,7 +815,7 @@ class EtherCATBus:
             target=self._processdata_loop, name="EtherCAT-ProcessData", daemon=False
         )
         self._pd_thread.start()
-        print("[BUS] ProcessData thread started (1 ms cycle)")
+        print(f"[BUS] ProcessData thread started ({self.processdata_cycle_time * 1000:.3f} ms cycle)")
 
         self._pdo_stop = threading.Event()
         self._pdo_thread = threading.Thread(
@@ -788,14 +843,21 @@ class EtherCATBus:
         self._check_thread = None
 
     def _processdata_loop(self):
-        """Fast send/receive — 1 ms cycle. No locks, no processing."""
+        """Fast send/receive at a fixed absolute deadline.
+
+        Uses release_gil when available so other Python threads can run
+        while pysoem waits for the EtherCAT frame.
+        """
+        cycle_s = self.processdata_cycle_time
+        t_next = time.perf_counter()
         while not self._pd_stop.is_set():
             if self._reconnecting.is_set():
                 time.sleep(0.05)
+                t_next = time.perf_counter()
                 continue
             try:
-                self.master.send_processdata()
-                self._actual_wkc = self.master.receive_processdata(10000)
+                self.master.send_processdata(**_SEND_PD_KWARGS)
+                self._actual_wkc = self.master.receive_processdata(10000, **_RECV_PD_KWARGS)
                 if self._actual_wkc != self.master.expected_wkc:
                     self._comm_error_count += 1
                     if self.master.in_op:
@@ -804,13 +866,17 @@ class EtherCATBus:
                     self._comm_ok_count += 1
             except Exception:
                 self._comm_error_count += 1
-            time.sleep(0.001)
+            t_next += cycle_s
+            _wait_deadline(t_next)
 
     def _pdo_update_loop(self):
         """Iterate over all registered slaves: decode RX, encode TX."""
+        cycle_s = self.cycle_time
+        t_next = time.perf_counter()
         while not self._pdo_stop.is_set():
             if self._reconnecting.is_set():
                 time.sleep(0.05)
+                t_next = time.perf_counter()
                 continue
             with self._lock:
                 for handle in self._slaves:
@@ -818,17 +884,21 @@ class EtherCATBus:
                         handle.pdo_update(self.master, self._reconnecting)
                     except Exception:
                         pass
-            time.sleep(self.cycle_time)
+            t_next += cycle_s
+            _wait_deadline(t_next)
 
     def _check_loop(self):
         """Monitor slave health and attempt recovery — 300 ms cycle."""
         _consecutive_lost = 0
         _RECONNECT_THRESHOLD = 7
+        _CYCLE_S = 0.3
+        t_next = time.perf_counter()
 
         while not self._check_stop.is_set():
             if self._reconnecting.is_set():
                 _consecutive_lost = 0
                 time.sleep(0.1)
+                t_next = time.perf_counter()
                 continue
 
             try:
@@ -861,11 +931,12 @@ class EtherCATBus:
                 and not self._reconnecting.is_set()
             ):
                 print(f"[BUS] Lost contact for "
-                      f"{_consecutive_lost * 0.3:.1f}s — triggering reconnect")
+                      f"{_consecutive_lost * _CYCLE_S:.1f}s — triggering reconnect")
                 _consecutive_lost = 0
                 self._attempt_reconnect()
 
-            time.sleep(0.3)
+            t_next += _CYCLE_S
+            _wait_deadline(t_next)
 
     # ------------------------------------------------------------------
     # Reconnect
@@ -952,8 +1023,8 @@ class EtherCATBus:
                 deadline = time.time() + 5.0
                 reached_op = False
                 while time.time() < deadline:
-                    self.master.send_processdata()
-                    self.master.receive_processdata(10000)
+                    self.master.send_processdata(**_SEND_PD_KWARGS)
+                    self.master.receive_processdata(10000, **_RECV_PD_KWARGS)
                     if self.master.state_check(
                         pysoem.OP_STATE, 1000
                     ) == pysoem.OP_STATE:
