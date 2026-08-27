@@ -7,7 +7,7 @@ name = "ethercat-master"
 version = "0.1.8"
 description = "Generic EtherCAT master library built on PySOEM — bus management, PDO mapping, slave discovery"
 readme = "README.md"
-license = {text = "MIT"}
+license = "MIT"
 requires-python = ">=3.8"
 authors = [
     {name = "Henschel Robotics GmbH", email = "info@henschel-robotics.ch"},
@@ -20,7 +20,6 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.8",
