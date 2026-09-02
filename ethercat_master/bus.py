@@ -48,19 +48,18 @@ from pathlib import Path
 
 import pysoem
 
-from .exceptions import ConnectionError, CommunicationError, ConfigurationError
+from .exceptions import CommunicationError, ConfigurationError, ConnectionError
 from .pdo import (
+    apply_startup_sdos,
     configure_pdo_mapping,
-    load_pdo_config,
     get_slave_pdo,
     get_slave_startup,
-    apply_startup_sdos,
+    load_pdo_config,
     pdo_mapping_exists,
     sanitize_invalid_pdo_assignments,
     slave_supports_coe_pdo_mapping,
     slave_supports_pdo_assignment,
 )
-
 
 _EC_STATES = {
     pysoem.NONE_STATE:   "NONE",
@@ -83,7 +82,6 @@ def _state_name(state_code):
 
 def _on_slave_emergency(_emcy):
     """CoE emergency handler so SDO traffic uses pysoem's callback path (not deprecated)."""
-    pass
 
 
 def register_emergency_callbacks(master):
@@ -109,35 +107,276 @@ def register_emergency_callbacks(master):
 # ------------------------------------------------------------------------------
 # High-resolution timing (sub-millisecond) helpers
 # ------------------------------------------------------------------------------
-def _switch_to_other_thread():
-    """Yield the current time slice if an OS API is available.
+if hasattr(ctypes, "windll") and ctypes.windll:
+    _SwitchToThread = ctypes.windll.kernel32.SwitchToThread
+else:
+    _SwitchToThread = None
 
-    Uses SwitchToThread on Windows and os.sched_yield on POSIX.
-    """
-    if hasattr(ctypes, "windll") and ctypes.windll:
-        ctypes.windll.kernel32.SwitchToThread()
-    else:
+_SCHED_YIELD = getattr(os, "sched_yield", None)
+_TIME_SLEEP = time.sleep
+_PERF_COUNTER = time.perf_counter
+
+
+def _yield_thread():
+    """Yield the current time slice if an OS API is available."""
+    switch = _SwitchToThread
+    if switch is not None:
+        switch()
+        return
+    sched = _SCHED_YIELD
+    if sched is not None:
         try:
-            os.sched_yield()
-        except (AttributeError, OSError):
+            sched()
+        except OSError:
             pass
 
 
-def _wait_deadline(deadline):
-    """Wait until *deadline* (seconds from perf_counter).
+def _set_process_high_priority():
+    """Best-effort raise of the current process priority class (Windows only)."""
+    try:
+        kernel32 = ctypes.windll.kernel32
+        kernel32.GetCurrentProcess.argtypes = []
+        kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+        kernel32.SetPriorityClass.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+        kernel32.SetPriorityClass.restype = ctypes.c_bool
+        process = kernel32.GetCurrentProcess()
+        # REALTIME_PRIORITY_CLASS = 0x100, HIGH_PRIORITY_CLASS = 0x80
+        if not kernel32.SetPriorityClass(process, 0x00000100):
+            kernel32.SetPriorityClass(process, 0x00000080)
+    except Exception:  # noqa: BLE001, S110
+        pass
 
-    For the final millisecond before the deadline we busy-wait with voluntary
-    yields to get sub-millisecond precision.  For longer waits we use
-    time.sleep() to avoid wasting CPU.
+
+def _set_current_thread_high_priority():
+    """Best-effort raise of the calling thread's scheduler priority.
+
+    On Windows this raises the current thread to TIME_CRITICAL within its
+    process class.  On Linux it attempts SCHED_FIFO with priority 80.
+    Failures are silently ignored so that the bus keeps running on restricted
+    accounts.
     """
+    try:
+        if _SwitchToThread is not None:
+            kernel32 = ctypes.windll.kernel32
+            kernel32.GetCurrentThread.argtypes = []
+            kernel32.GetCurrentThread.restype = ctypes.c_void_p
+            kernel32.SetThreadPriority.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            kernel32.SetThreadPriority.restype = ctypes.c_bool
+            thread = kernel32.GetCurrentThread()
+            # THREAD_PRIORITY_TIME_CRITICAL
+            kernel32.SetThreadPriority(thread, 15)
+            return
+        # Linux: SCHED_FIFO on the calling thread.
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+
+        class _SchedParam(ctypes.Structure):
+            _fields_ = [("sched_priority", ctypes.c_int)]
+
+        param = _SchedParam(80)
+        # SCHED_FIFO = 1, pid 0 -> calling thread/process
+        libc.sched_setscheduler(0, 1, ctypes.byref(param))
+    except Exception:  # noqa: BLE001, S110
+        pass
+
+
+def _affinity_mask(cpus):
+    """Convert a CPU affinity description to a bitmask.
+
+    Accepts an integer bitmask or an iterable of CPU indices.
+    Returns an integer mask or ``None`` if *cpus* is empty/None.
+    """
+    if cpus is None:
+        return None
+    if isinstance(cpus, int):
+        return cpus
+    mask = 0
+    for cpu in cpus:
+        mask |= 1 << int(cpu)
+    return mask if mask else None
+
+
+def _set_current_thread_affinity(cpus):
+    """Best-effort pin of the calling thread to the given CPU(s) (Windows only).
+
+    *cpus* may be an integer bitmask or an iterable of CPU indices.
+    Failures are silently ignored so that the bus keeps running on restricted
+    accounts or non-Windows systems.
+    """
+    mask = _affinity_mask(cpus)
+    if mask is None or _SwitchToThread is None:
+        return None
+    try:
+        kernel32 = ctypes.windll.kernel32
+        kernel32.GetCurrentThread.argtypes = []
+        kernel32.GetCurrentThread.restype = ctypes.c_void_p
+        kernel32.SetThreadAffinityMask.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+        kernel32.SetThreadAffinityMask.restype = ctypes.c_size_t
+        thread = kernel32.GetCurrentThread()
+        return kernel32.SetThreadAffinityMask(thread, mask)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _set_process_affinity(cpus):
+    """Best-effort pin of the whole process to the given CPU(s) (Windows only).
+
+    Use with caution: restricting the process to too few cores can starve
+    other threads or make the system unresponsive.
+    """
+    mask = _affinity_mask(cpus)
+    if mask is None or _SwitchToThread is None:
+        return None
+    try:
+        kernel32 = ctypes.windll.kernel32
+        kernel32.GetCurrentProcess.argtypes = []
+        kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+        kernel32.SetProcessAffinityMask.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+        kernel32.SetProcessAffinityMask.restype = ctypes.c_bool
+        process = kernel32.GetCurrentProcess()
+        return kernel32.SetProcessAffinityMask(process, mask)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _set_win_timer_resolution(resolution_us):
+    """Best-effort raise of the Windows timer resolution.
+
+    First tries the undocumented ``NtSetTimerResolution`` (ntdll), which can
+    reach ~0.5 ms on many systems. If that fails or is unavailable it falls
+    back to the documented ``timeBeginPeriod`` API (winmm), which usually
+    achieves 1 ms.
+
+    Returns the actually achieved resolution in microseconds, or ``None`` if
+    no API was available or the call failed.
+    """
+    if _SwitchToThread is None or resolution_us is None or resolution_us <= 0:
+        return None
+
+    # Try NtSetTimerResolution first: it can achieve sub-millisecond values.
+    try:
+        ntdll = ctypes.windll.ntdll
+        ntdll.NtSetTimerResolution.argtypes = [
+            ctypes.c_ulong, ctypes.c_ubyte, ctypes.POINTER(ctypes.c_ulong)
+        ]
+        ntdll.NtSetTimerResolution.restype = ctypes.c_long
+        desired = ctypes.c_ulong(int(resolution_us) * 10)  # 100-ns units
+        actual = ctypes.c_ulong()
+        # STATUS_SUCCESS = 0
+        if ntdll.NtSetTimerResolution(desired, 1, ctypes.byref(actual)) >= 0:
+            return actual.value / 10.0
+    except Exception:  # noqa: BLE001, S110
+        pass
+
+    # Fallback to the documented multimedia timer API.
+    try:
+        winmm = ctypes.windll.winmm
+        winmm.timeBeginPeriod.argtypes = [ctypes.c_uint]
+        winmm.timeBeginPeriod.restype = ctypes.c_uint
+        # timeBeginPeriod takes milliseconds and is reference-counted per period.
+        period_ms = max(1, int(resolution_us // 1000))
+        if winmm.timeBeginPeriod(period_ms) == 0:
+            return period_ms * 1000
+    except Exception:  # noqa: BLE001, S110
+        pass
+
+    return None
+
+
+def _reset_win_timer_resolution(resolution_us):
+    """Reset a timer resolution previously set by ``_set_win_timer_resolution``.
+
+    The value passed should be the *requested* ``resolution_us`` (used to
+    decide whether ``timeEndPeriod`` or ``NtSetTimerResolution(..., 0)`` is
+    needed).
+    """
+    if _SwitchToThread is None or resolution_us is None or resolution_us <= 0:
+        return
+
+    try:
+        winmm = ctypes.windll.winmm
+        winmm.timeEndPeriod.argtypes = [ctypes.c_uint]
+        winmm.timeEndPeriod.restype = ctypes.c_uint
+        period_ms = max(1, int(resolution_us // 1000))
+        winmm.timeEndPeriod(period_ms)
+    except Exception:  # noqa: BLE001, S110
+        pass
+
+    try:
+        ntdll = ctypes.windll.ntdll
+        ntdll.NtSetTimerResolution.argtypes = [
+            ctypes.c_ulong, ctypes.c_ubyte, ctypes.POINTER(ctypes.c_ulong)
+        ]
+        ntdll.NtSetTimerResolution.restype = ctypes.c_long
+        desired = ctypes.c_ulong(int(resolution_us) * 10)
+        actual = ctypes.c_ulong()
+        ntdll.NtSetTimerResolution(desired, 0, ctypes.byref(actual))
+    except Exception:  # noqa: BLE001, S110
+        pass
+
+
+def _wait_deadline_precise(deadline):
+    """Busy-wait/yield until *deadline* for the lowest possible jitter."""
+    perf_counter = _PERF_COUNTER
+    switch = _yield_thread
+    sleep = _TIME_SLEEP
     while True:
-        remaining = deadline - time.perf_counter()
+        remaining = deadline - perf_counter()
         if remaining <= 0:
             return
         if remaining > 0.002:
-            time.sleep(remaining - 0.001)
+            sleep(remaining - 0.001)
         else:
-            _switch_to_other_thread()
+            switch()
+
+
+def _wait_deadline_balanced(deadline):
+    """Sleep for long waits, yield for short ones; lower CPU, moderate jitter."""
+    perf_counter = _PERF_COUNTER
+    switch = _yield_thread
+    sleep = _TIME_SLEEP
+    threshold = 0.0005
+    min_sleep = 0.002
+    while True:
+        remaining = deadline - perf_counter()
+        if remaining <= 0:
+            return
+        if remaining > threshold + min_sleep:
+            sleep(remaining - threshold)
+        else:
+            switch()
+
+
+def _wait_deadline_low_cpu(deadline):
+    """Sleep-based wait; higher jitter but lowest CPU usage.
+
+    Best suited for cycle times well above the OS timer resolution.
+    """
+    perf_counter = _PERF_COUNTER
+    sleep = _TIME_SLEEP
+    while True:
+        remaining = deadline - perf_counter()
+        if remaining <= 0:
+            return
+        sleep(remaining)
+
+
+def _make_wait_deadline(policy):
+    """Return the wait function for *policy*.
+
+    Policies:
+        ``precise``  — busy-yield for sub-ms precision (highest CPU).
+        ``balanced`` — sleep until 0.5 ms from deadline, then yield.
+        ``low_cpu``  — sleep only; accept OS timer resolution jitter.
+    """
+    if policy == "low_cpu":
+        return _wait_deadline_low_cpu
+    if policy == "balanced":
+        return _wait_deadline_balanced
+    return _wait_deadline_precise
+
+
+# Sentinel for constructor arguments that may be overridden by the JSON config.
+_MISSING = object()
 
 
 # Detect whether this pysoem build supports release_gil= on the PDO calls.
@@ -169,10 +408,36 @@ class EtherCATBus:
         pdo_config_path: Optional path to an ``ethercat_config.json`` file.
             When provided, per-slave PDO assignments are read from
             this file instead of using the hardcoded defaults.
+        timing_stats: When ``True``, the ProcessData and PDO Update loops
+            collect cycle-time statistics. Call :meth:`get_timing_stats`
+            to retrieve them. Adds a small per-cycle overhead.
+        timing_policy: How the ProcessData and PDO Update loops wait for
+            the next cycle deadline. ``"precise"`` busy-yields for the
+            lowest jitter, ``"balanced"`` sleeps part of the cycle to
+            reduce CPU, and ``"low_cpu"`` sleeps the full interval.  May
+            also be set in ``ethercat_config.json`` under ``network``.
+        high_priority: When ``True``, attempt to raise the process priority
+            class (Windows) and the worker thread priorities at bus start.
+            This can reduce scheduler-induced jitter, but may starve other
+            threads/processes; use with caution.  May also be set in
+            ``ethercat_config.json`` under ``network``.
+        timer_resolution_us: Windows-only. Request a higher timer resolution
+            (e.g. ``1000`` for 1 ms) when the bus starts. This improves the
+            accuracy of ``time.sleep`` calls made by other threads such as
+            the state-check or SDO-telemetry loops. Pass ``None`` to leave
+            the system default unchanged. May also be set in
+            ``ethercat_config.json`` under ``network``.
+        cpu_affinity: Windows-only. Pin the ProcessData and PDO Update
+            threads to the given CPU(s). Accepts an integer bitmask or a
+            list of CPU indices, e.g. ``[2, 3]``. Leave as ``None`` to let
+            the OS schedule freely. May also be set in
+            ``ethercat_config.json`` under ``network``.
     """
 
     def __init__(self, adapter=None, cycle_time_ms=10, processdata_cycle_ms=None,
-                 pdo_config_path=None):
+                 pdo_config_path=None, timing_stats=False, timing_policy=_MISSING,
+                 high_priority=_MISSING, timer_resolution_us=_MISSING,
+                 cpu_affinity=_MISSING):
         if pdo_config_path:
             self.pdo_config = load_pdo_config(pdo_config_path)
             net = self._read_network_config(pdo_config_path)
@@ -182,8 +447,24 @@ class EtherCATBus:
                 cycle_time_ms = net["cycle_ms"]
             if processdata_cycle_ms is None and net.get("processdata_cycle_ms"):
                 processdata_cycle_ms = net["processdata_cycle_ms"]
+            if timing_policy is _MISSING:
+                timing_policy = net.get("timing_policy", "precise")
+            if high_priority is _MISSING:
+                high_priority = net.get("high_priority", False)
+            if timer_resolution_us is _MISSING:
+                timer_resolution_us = net.get("timer_resolution_us", None)
+            if cpu_affinity is _MISSING:
+                cpu_affinity = net.get("cpu_affinity", None)
         else:
             self.pdo_config = None
+            if timing_policy is _MISSING:
+                timing_policy = "precise"
+            if high_priority is _MISSING:
+                high_priority = False
+            if timer_resolution_us is _MISSING:
+                timer_resolution_us = None
+            if cpu_affinity is _MISSING:
+                cpu_affinity = None
 
         self.adapter = adapter
         self.cycle_time = cycle_time_ms / 1000.0
@@ -193,6 +474,7 @@ class EtherCATBus:
 
         self.master = None
         self._slaves = []
+        self._slaves_snapshot = ()
         self._lock = threading.Lock()
 
         self._pd_thread = None
@@ -205,6 +487,17 @@ class EtherCATBus:
         self._comm_ok_count = 0
         self._comm_error_count = 0
         self._actual_wkc = 0
+
+        self._timing_stats_enabled = timing_stats
+        self._timing_stats = self._empty_timing_stats()
+        self.timing_policy = timing_policy
+        self._wait_deadline = _make_wait_deadline(timing_policy)
+        self.high_priority = high_priority
+        self.timer_resolution_us = (int(timer_resolution_us)
+                                    if timer_resolution_us is not None
+                                    else None)
+        self.cpu_affinity = cpu_affinity
+        self._actual_timer_resolution_us = None
 
         self.auto_reconnect = True
         self._reconnecting = threading.Event()
@@ -336,6 +629,7 @@ class EtherCATBus:
 
             slaves = []
             for i, slave in enumerate(master.slaves):
+                pdo_cache = {}
                 info = {
                     "index": i,
                     "name": slave.name if isinstance(slave.name, str)
@@ -344,14 +638,14 @@ class EtherCATBus:
                     "product_code": f"0x{slave.id:08X}",
                     "revision": f"0x{slave.rev:08X}",
                     "state": _state_name(slave.state),
-                    "output_bytes": len(bytes(slave.output)) if slave.output else 0,
-                    "input_bytes": len(bytes(slave.input)) if slave.input else 0,
+                    "output_bytes": len(slave.output) if slave.output else 0,
+                    "input_bytes": len(slave.input) if slave.input else 0,
                 }
 
                 cls._read_identity_strings(slave, info)
-                info["rx_pdo"] = cls._read_pdo_assignment(slave, 0x1C12, "RxPDO")
-                info["tx_pdo"] = cls._read_pdo_assignment(slave, 0x1C13, "TxPDO")
-                avail_rx, avail_tx = cls._discover_available_pdos(slave)
+                info["rx_pdo"] = cls._read_pdo_assignment(slave, 0x1C12, "RxPDO", pdo_cache)
+                info["tx_pdo"] = cls._read_pdo_assignment(slave, 0x1C13, "TxPDO", pdo_cache)
+                avail_rx, avail_tx = cls._discover_available_pdos(slave, pdo_cache)
                 info["available_rx_pdo"] = avail_rx
                 info["available_tx_pdo"] = avail_tx
 
@@ -391,7 +685,7 @@ class EtherCATBus:
             ("fw_version", 0x100A),
         ]:
             info[key] = ""
-            for sz in (64, 32, 16, None):
+            for sz in (128, None):
                 try:
                     raw = (slave.sdo_read(idx, 0) if sz is None
                            else slave.sdo_read(idx, 0, sz))
@@ -403,7 +697,7 @@ class EtherCATBus:
                     continue
 
     @classmethod
-    def _read_pdo_assignment(cls, slave, sm_index, label):
+    def _read_pdo_assignment(cls, slave, sm_index, label, _cache=None):
         """Read PDO assignment list from SM2 (0x1C12) or SM3 (0x1C13).
 
         Returns a list of dicts with ``pdo_index`` and ``objects``.
@@ -426,13 +720,13 @@ class EtherCATBus:
                 continue
 
             pdo_entry = {"pdo_index": f"0x{pdo_idx:04X}", "objects": []}
-            pdo_entry["objects"] = cls._read_pdo_mapping(slave, pdo_idx)
+            pdo_entry["objects"] = cls._read_pdo_mapping(slave, pdo_idx, _cache)
             result.append(pdo_entry)
 
         return result
 
     @staticmethod
-    def _read_pdo_mapping(slave, pdo_index):
+    def _read_pdo_mapping(slave, pdo_index, _cache=None):
         """Read the mapping entries for a single PDO index.
 
         Each mapping entry is a 32-bit value:
@@ -440,11 +734,15 @@ class EtherCATBus:
           bits 15..8  = subindex
           bits  7..0  = bit length
         """
+        if _cache is not None and pdo_index in _cache:
+            return _cache[pdo_index]
         objects = []
         try:
             raw = slave.sdo_read(pdo_index, 0)
             n_entries = raw[0] if raw else 0
         except Exception:
+            if _cache is not None:
+                _cache[pdo_index] = objects
             return objects
 
         for sub in range(1, n_entries + 1):
@@ -461,10 +759,12 @@ class EtherCATBus:
                 })
             except Exception:
                 continue
+        if _cache is not None:
+            _cache[pdo_index] = objects
         return objects
 
     @classmethod
-    def _discover_available_pdos(cls, slave):
+    def _discover_available_pdos(cls, slave, _cache=None):
         """Probe a slave for all available RxPDO and TxPDO indices.
 
         Scans 0x1600..0x160F (RxPDO) and 0x1A00..0x1A0F (TxPDO).
@@ -480,7 +780,7 @@ class EtherCATBus:
                 if n > 0:
                     rx.append({
                         "pdo_index": f"0x{idx:04X}",
-                        "objects": cls._read_pdo_mapping(slave, idx),
+                        "objects": cls._read_pdo_mapping(slave, idx, _cache),
                     })
             except Exception:
                 continue
@@ -493,7 +793,7 @@ class EtherCATBus:
                 if n > 0:
                     tx.append({
                         "pdo_index": f"0x{idx:04X}",
-                        "objects": cls._read_pdo_mapping(slave, idx),
+                        "objects": cls._read_pdo_mapping(slave, idx, _cache),
                     })
             except Exception:
                 continue
@@ -518,11 +818,13 @@ class EtherCATBus:
         """
         with self._lock:
             self._slaves.append(slave_handle)
+            self._slaves_snapshot = tuple(self._slaves)
 
     def unregister_slave(self, slave_handle):
         """Remove a slave handle from the PDO cycle."""
         with self._lock:
             self._slaves = [s for s in self._slaves if s is not slave_handle]
+            self._slaves_snapshot = tuple(self._slaves)
 
     # ------------------------------------------------------------------
     # Open / Close
@@ -624,8 +926,8 @@ class EtherCATBus:
 
         print("[BUS] I/O map after config_map():")
         for i, slave in enumerate(self.master.slaves):
-            out_sz = len(bytes(slave.output)) if slave.output else 0
-            in_sz = len(bytes(slave.input)) if slave.input else 0
+            out_sz = len(slave.output) if slave.output else 0
+            in_sz = len(slave.input) if slave.input else 0
             name = slave.name if isinstance(slave.name, str) else slave.name.decode("utf-8", errors="replace")
             print(f"  [{i}] {name}: Out={out_sz}B, In={in_sz}B")
 
@@ -769,8 +1071,8 @@ class EtherCATBus:
             al_hex = f"0x{al_status:04X}" if al_status else "N/A"
             al_text = self._AL_STATUS_CODES.get(al_status, "Unknown") if al_status else ""
 
-            out_sz = len(bytes(slave.output)) if slave.output else 0
-            in_sz = len(bytes(slave.input)) if slave.input else 0
+            out_sz = len(slave.output) if slave.output else 0
+            in_sz = len(slave.input) if slave.input else 0
 
             line = f"  [{i}] {name}: state={state}, AL={al_hex}"
             if al_text:
@@ -805,11 +1107,75 @@ class EtherCATBus:
     def connected(self):
         return self.master is not None and self.master.in_op
 
+    @staticmethod
+    def _empty_timing_stats():
+        return {
+            "pd_cycles": 0,
+            "pd_missed": 0,
+            "pd_errors": 0,
+            "pd_min_s": float("inf"),
+            "pd_max_s": 0.0,
+            "pd_sum_s": 0.0,
+            "pd_sum_sq_s": 0.0,
+            "pdo_cycles": 0,
+            "pdo_missed": 0,
+            "pdo_min_s": float("inf"),
+            "pdo_max_s": 0.0,
+            "pdo_sum_s": 0.0,
+            "pdo_sum_sq_s": 0.0,
+        }
+
+    @staticmethod
+    def _update_timing(stats, key_prefix, duration, cycle_s):
+        stats[f"{key_prefix}_cycles"] += 1
+        stats[f"{key_prefix}_sum_s"] += duration
+        stats[f"{key_prefix}_sum_sq_s"] += duration * duration
+        stats[f"{key_prefix}_min_s"] = min(stats[f"{key_prefix}_min_s"], duration)
+        stats[f"{key_prefix}_max_s"] = max(stats[f"{key_prefix}_max_s"], duration)
+        if duration > cycle_s * 1.05:
+            stats[f"{key_prefix}_missed"] += 1
+
+    def get_timing_stats(self):
+        """Return collected ProcessData / PDO Update timing statistics.
+
+        Only available when the bus was created with ``timing_stats=True``.
+        Returns ``None`` when timing is disabled.
+        """
+        if not self._timing_stats_enabled:
+            return None
+        stats = self._timing_stats.copy()
+        for key in ("pd", "pdo"):
+            n = stats[f"{key}_cycles"]
+            if n == 0:
+                continue
+            mean = stats[f"{key}_sum_s"] / n
+            variance = stats[f"{key}_sum_sq_s"] / n - mean * mean
+            stats[f"{key}_mean_ms"] = mean * 1000.0
+            stats[f"{key}_std_ms"] = (variance ** 0.5) * 1000.0
+            stats[f"{key}_min_ms"] = stats[f"{key}_min_s"] * 1000.0
+            stats[f"{key}_max_ms"] = stats[f"{key}_max_s"] * 1000.0
+        return stats
+
+    def reset_timing_stats(self):
+        """Reset collected timing statistics."""
+        self._timing_stats = self._empty_timing_stats()
+
     # ------------------------------------------------------------------
     # Internal: threads
     # ------------------------------------------------------------------
 
     def _start_threads(self):
+        if self._timing_stats_enabled:
+            self.reset_timing_stats()
+        if self.high_priority:
+            _set_process_high_priority()
+        if self.timer_resolution_us:
+            self._actual_timer_resolution_us = _set_win_timer_resolution(
+                self.timer_resolution_us
+            )
+            if self._actual_timer_resolution_us:
+                print(f"[BUS] Windows timer resolution set to "
+                      f"{self._actual_timer_resolution_us:.0f} us")
         self._pd_stop = threading.Event()
         self._pd_thread = threading.Thread(
             target=self._processdata_loop, name="EtherCAT-ProcessData", daemon=False
@@ -838,6 +1204,9 @@ class EtherCATBus:
         for thr in (self._pd_thread, self._pdo_thread, self._check_thread):
             if thr:
                 thr.join(timeout=2.0)
+        if self._actual_timer_resolution_us is not None:
+            _reset_win_timer_resolution(self.timer_resolution_us)
+            self._actual_timer_resolution_us = None
         self._pd_thread = None
         self._pdo_thread = None
         self._check_thread = None
@@ -849,43 +1218,94 @@ class EtherCATBus:
         while pysoem waits for the EtherCAT frame.
         """
         cycle_s = self.processdata_cycle_time
-        t_next = time.perf_counter()
-        while not self._pd_stop.is_set():
-            if self._reconnecting.is_set():
-                time.sleep(0.05)
-                t_next = time.perf_counter()
+        timing = self._timing_stats_enabled
+        stats = self._timing_stats
+        update_timing = self._update_timing
+        pd_stop = self._pd_stop
+        reconnecting = self._reconnecting
+        send_pd_kwargs = _SEND_PD_KWARGS
+        recv_pd_kwargs = _RECV_PD_KWARGS
+        wait_deadline = self._wait_deadline
+        sleep = time.sleep
+        perf_counter = time.perf_counter
+        master = self.master
+        send_processdata = master.send_processdata
+        receive_processdata = master.receive_processdata
+        t_next = perf_counter()
+        t_start = t_next
+        if self.high_priority:
+            _set_current_thread_high_priority()
+        if self.cpu_affinity:
+            _set_current_thread_affinity(self.cpu_affinity)
+        while not pd_stop.is_set():
+            if reconnecting.is_set():
+                sleep(0.05)
+                t_next = perf_counter()
+                t_start = t_next
+                master = self.master
+                if master is None:
+                    continue
+                send_processdata = master.send_processdata
+                receive_processdata = master.receive_processdata
                 continue
             try:
-                self.master.send_processdata(**_SEND_PD_KWARGS)
-                self._actual_wkc = self.master.receive_processdata(10000, **_RECV_PD_KWARGS)
-                if self._actual_wkc != self.master.expected_wkc:
+                send_processdata(**send_pd_kwargs)
+                actual_wkc = receive_processdata(10000, **recv_pd_kwargs)
+                self._actual_wkc = actual_wkc
+                if actual_wkc != master.expected_wkc:
                     self._comm_error_count += 1
-                    if self.master.in_op:
-                        self.master.do_check_state = True
+                    if master.in_op:
+                        master.do_check_state = True
+                    if timing:
+                        stats["pd_errors"] += 1
                 else:
                     self._comm_ok_count += 1
             except Exception:
                 self._comm_error_count += 1
+                if timing:
+                    stats["pd_errors"] += 1
             t_next += cycle_s
-            _wait_deadline(t_next)
+            wait_deadline(t_next)
+            if timing:
+                t_now = perf_counter()
+                update_timing(stats, "pd", t_now - t_start, cycle_s)
+                t_start = t_now
 
     def _pdo_update_loop(self):
         """Iterate over all registered slaves: decode RX, encode TX."""
         cycle_s = self.cycle_time
-        t_next = time.perf_counter()
-        while not self._pdo_stop.is_set():
-            if self._reconnecting.is_set():
-                time.sleep(0.05)
-                t_next = time.perf_counter()
+        timing = self._timing_stats_enabled
+        stats = self._timing_stats
+        update_timing = self._update_timing
+        pdo_stop = self._pdo_stop
+        reconnecting = self._reconnecting
+        wait_deadline = self._wait_deadline
+        sleep = time.sleep
+        perf_counter = time.perf_counter
+        t_next = perf_counter()
+        t_start = t_next
+        if self.high_priority:
+            _set_current_thread_high_priority()
+        if self.cpu_affinity:
+            _set_current_thread_affinity(self.cpu_affinity)
+        while not pdo_stop.is_set():
+            if reconnecting.is_set():
+                sleep(0.05)
+                t_next = perf_counter()
+                t_start = t_next
                 continue
-            with self._lock:
-                for handle in self._slaves:
-                    try:
-                        handle.pdo_update(self.master, self._reconnecting)
-                    except Exception:
-                        pass
+            master = self.master
+            for handle in self._slaves_snapshot:
+                try:
+                    handle.pdo_update(master, reconnecting)
+                except Exception:
+                    pass
             t_next += cycle_s
-            _wait_deadline(t_next)
+            wait_deadline(t_next)
+            if timing:
+                t_now = perf_counter()
+                update_timing(stats, "pdo", t_now - t_start, cycle_s)
+                t_start = t_now
 
     def _check_loop(self):
         """Monitor slave health and attempt recovery — 300 ms cycle."""
@@ -936,7 +1356,7 @@ class EtherCATBus:
                 self._attempt_reconnect()
 
             t_next += _CYCLE_S
-            _wait_deadline(t_next)
+            self._wait_deadline(t_next)
 
     # ------------------------------------------------------------------
     # Reconnect

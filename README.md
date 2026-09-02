@@ -143,13 +143,17 @@ for s in slaves:
 
 ## PDO Configuration
 
-Create a `ethercat_config.json` to control which PDOs are assigned per slave:
+Create a `ethercat_config.json` to control the network adapter, real-time
+behaviour, and which PDOs are assigned per slave:
 
 ```json
 {
   "network": {
     "adapter": "\\Device\\NPF_{...}",
-    "cycle_ms": 1.0
+    "cycle_ms": 1.0,
+    "processdata_cycle_ms": 1.0,
+    "timing_policy": "precise",
+    "high_priority": true
   },
   "default": {},
   "slaves": {
@@ -160,6 +164,15 @@ Create a `ethercat_config.json` to control which PDOs are assigned per slave:
   }
 }
 ```
+
+- `cycle_ms`: PDO update cycle time in milliseconds.
+- `processdata_cycle_ms`: Raw EtherCAT send/receive cycle in milliseconds.
+  Defaults to `1.0` when omitted. Set this to the desired bus frequency
+  independently of `cycle_ms`.
+- `timing_policy`: One of `precise` (busy-yield, lowest jitter), `balanced`
+  (sleep then yield, lower CPU), or `low_cpu` (sleep only, highest jitter).
+- `high_priority`: Raise process/thread priority at bus start to reduce
+  scheduler jitter. Use with caution; may starve other threads.
 
 Pass it when creating the bus:
 

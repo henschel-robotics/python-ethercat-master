@@ -18,23 +18,23 @@ Usage::
 Then open http://localhost:8080 in your browser.
 """
 
+from __future__ import annotations
+
 import argparse
 import json
+import sys as _sys
 import threading
-from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import parse_qs, urlparse
 
 try:
     from .bus import EtherCATBus
-    from .pdo import load_pdo_config, get_slave_pdo
     from .network_test import NetworkLatencyTest
     from .slave import GenericSlave
 except ImportError:
-    import sys as _sys
     _sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from ethercat_master.bus import EtherCATBus
-    from ethercat_master.pdo import load_pdo_config, get_slave_pdo
     from ethercat_master.network_test import NetworkLatencyTest
     from ethercat_master.slave import GenericSlave
 
@@ -44,7 +44,15 @@ except ImportError:
 
 
 def _load_net_config(pdo_config_path: str | None) -> dict:
-    defaults = {"adapter": None, "cycle_ms": 1.0}
+    defaults = {
+        "adapter": None,
+        "cycle_ms": 1.0,
+        "processdata_cycle_ms": None,
+        "timing_policy": "precise",
+        "high_priority": False,
+        "timer_resolution_us": None,
+        "cpu_affinity": None,
+    }
     try:
         if pdo_config_path and Path(pdo_config_path).exists():
             raw = json.loads(Path(pdo_config_path).read_text(encoding="utf-8"))
@@ -53,6 +61,16 @@ def _load_net_config(pdo_config_path: str | None) -> dict:
                 defaults["adapter"] = net["adapter"]
             if "cycle_ms" in net:
                 defaults["cycle_ms"] = float(net["cycle_ms"])
+            if "processdata_cycle_ms" in net:
+                defaults["processdata_cycle_ms"] = float(net["processdata_cycle_ms"])
+            if "timing_policy" in net:
+                defaults["timing_policy"] = net["timing_policy"]
+            if "high_priority" in net:
+                defaults["high_priority"] = bool(net["high_priority"])
+            if "timer_resolution_us" in net:
+                defaults["timer_resolution_us"] = int(net["timer_resolution_us"])
+            if "cpu_affinity" in net:
+                defaults["cpu_affinity"] = net["cpu_affinity"]
     except Exception:
         pass
     return defaults
@@ -66,7 +84,10 @@ def _save_net_config(pdo_config_path: str | None, adapter: str | None, cycle_ms:
         existing = {}
         if p.exists():
             existing = json.loads(p.read_text(encoding="utf-8"))
-        existing["network"] = {"adapter": adapter, "cycle_ms": cycle_ms}
+        net = existing.get("network", {})
+        net["adapter"] = adapter
+        net["cycle_ms"] = cycle_ms
+        existing["network"] = net
         p.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
     except Exception:
         pass

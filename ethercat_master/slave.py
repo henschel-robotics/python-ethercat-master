@@ -47,6 +47,16 @@ class GenericSlave:
             cycle after inputs are read.
     """
 
+    __slots__ = (
+        "_input",
+        "_output",
+        "_pysoem_slave",
+        "_zero_output",
+        "on_cycle",
+        "slave_index",
+        "use_default_pdo",
+    )
+
     def __init__(self, slave_index, use_default_pdo=True, on_cycle=None):
         self.slave_index = slave_index
         self.use_default_pdo = use_default_pdo
@@ -54,6 +64,7 @@ class GenericSlave:
         self._pysoem_slave = None
         self._input = b""
         self._output = b""
+        self._zero_output = b""
 
     @property
     def input(self) -> bytes:
@@ -79,7 +90,8 @@ class GenericSlave:
     def seed_tx(self, pysoem_slave):
         """Called once after config_map to initialise the output buffer
         with zeros so the slave receives valid data on the first cycle."""
-        self._output = bytes(len(pysoem_slave.output))
+        self._zero_output = bytes(len(pysoem_slave.output))
+        self._output = self._zero_output
         pysoem_slave.output = self._output
 
     def pdo_update(self, master, reconnecting):
@@ -97,7 +109,10 @@ class GenericSlave:
         """Called during bus shutdown.  Zeroes all outputs so the slave
         does not hold its last commanded state."""
         if self._pysoem_slave and len(self._pysoem_slave.output) > 0:
-            self._pysoem_slave.output = bytes(len(self._pysoem_slave.output))
+            out_len = len(self._pysoem_slave.output)
+            if len(self._zero_output) != out_len:
+                self._zero_output = bytes(out_len)
+            self._pysoem_slave.output = self._zero_output
 
     def on_reconnect(self, master):
         """Called after the bus recovers from a connection loss.
