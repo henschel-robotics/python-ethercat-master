@@ -948,7 +948,18 @@ class EtherCATBus:
         self.master.write_state()
         print("[BUS] Requested OP state transition...")
 
-        if self.master.state_check(pysoem.OP_STATE, 50000) != pysoem.OP_STATE:
+        # Poll with short state_check timeouts so the ProcessData thread
+        # can keep feeding the slave watchdog between checks.  A single
+        # 50 ms state_check holds the GIL and starves the cyclic frames.
+        reached_op = False
+        deadline = time.perf_counter() + 5.0
+        while time.perf_counter() < deadline:
+            if self.master.state_check(pysoem.OP_STATE, 1000) == pysoem.OP_STATE:
+                reached_op = True
+                break
+            time.sleep(0.001)
+
+        if not reached_op:
             self._stop_threads()
             details = self._slave_state_report()
             raise ConnectionError(
