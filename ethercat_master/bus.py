@@ -44,11 +44,12 @@ import os
 import struct
 import threading
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 import pysoem
 
-from .exceptions import CommunicationError, ConfigurationError, ConnectionError
+from .exceptions import ConfigurationError, ConnectionError
 from .pdo import (
     apply_startup_sdos,
     configure_pdo_mapping,
@@ -432,12 +433,44 @@ class EtherCATBus:
             list of CPU indices, e.g. ``[2, 3]``. Leave as ``None`` to let
             the OS schedule freely. May also be set in
             ``ethercat_config.json`` under ``network``.
+        dc_sync0_cycle_ns: Enable Distributed-Clocks SYNC0 on every slave
+            with this cycle time (nanoseconds) between SAFE-OP and OP.
+            Required by DC-synchronous devices (servo drives, SSC/netX
+            slaves in DC mode). ``None`` (default) leaves DC untouched.
+        op_attempts: How often the OP transition is requested before giving
+            up. Some slaves need a few valid process-data cycles before they
+            accept OP; retrying after a short pause helps them along.
+        op_timeout_s: Time to wait for OP per attempt.
+        sdo_read_timeout_us / sdo_write_timeout_us: Override pysoem's
+            default SDO timeouts (microseconds) on the master, e.g. for
+            firmware-update commands that block for many seconds.
+        config_map_error_filter: Optional ``callable(exc) -> bool``. When
+            ``config_map()`` raises and the filter returns ``True`` the error
+            is logged and bring-up continues with whatever process-data image
+            was built (possibly 0 bytes). Use this for slaves that expose no
+            readable 0x1C00 and where a diagnostics-only connection is still
+            useful. Default: any error aborts.
+        reconnect_lock: Optional context manager that is held while the
+            master is closed, replaced and brought back up during an
+            automatic reconnect. Share it with application threads that do
+            SDO/FoE traffic so they never touch a half-built master.
+        on_connection_lost / on_reconnected: Optional zero-argument
+            callbacks invoked when a reconnect starts / succeeds. Exceptions
+            raised by a hook are logged and ignored.
+
+    After a (re)connect :attr:`settled` is set once every slave has run
+    clean in OP for :attr:`settle_time_s`; use :meth:`wait_settled` to defer
+    non-essential SDO traffic (telemetry, version reads) until then.
     """
 
     def __init__(self, adapter=None, cycle_time_ms=10, processdata_cycle_ms=None,
                  pdo_config_path=None, timing_stats=False, timing_policy=_MISSING,
                  high_priority=_MISSING, timer_resolution_us=_MISSING,
-                 cpu_affinity=_MISSING):
+                 cpu_affinity=_MISSING, dc_sync0_cycle_ns=None,
+                 op_attempts=1, op_timeout_s=5.0,
+                 sdo_read_timeout_us=None, sdo_write_timeout_us=None,
+                 config_map_error_filter=None, reconnect_lock=None,
+                 on_connection_lost=None, on_reconnected=None):
         if pdo_config_path:
             self.pdo_config = load_pdo_config(pdo_config_path)
             net = self._read_network_config(pdo_config_path)
@@ -501,6 +534,35 @@ class EtherCATBus:
 
         self.auto_reconnect = True
         self._reconnecting = threading.Event()
+
+        self.dc_sync0_cycle_ns = dc_sync0_cycle_ns
+        self.op_attempts = op_attempts
+        self.op_timeout_s = op_timeout_s
+        self.sdo_read_timeout_us = sdo_read_timeout_us
+        self.sdo_write_timeout_us = sdo_write_timeout_us
+        self.config_map_error_filter = config_map_error_filter
+        self.reconnect_lock = reconnect_lock
+        self.on_connection_lost = on_connection_lost
+        self.on_reconnected = on_reconnected
+
+        # A slave that drops to SAFE-OP(+ERROR) — typically AL 0x1B, SM
+        # watchdog, after a blocking mailbox call stalled the ProcessData
+        # thread — is brought back by the ack -> OP-request cycle within
+        # about a second.  Such checks only count toward the reconnect
+        # threshold once the slave has not been seen in OP for this long.
+        self.recover_grace_s = 5.0
+        self._last_op_seen = 0.0
+
+        # `settled` is set once every slave has been in OP with a full
+        # working counter for `settle_time_s` after open()/reconnect and is
+        # cleared whenever a reconnect starts.  Applications should hold
+        # their non-essential SDO traffic (telemetry, version reads, ...)
+        # until the bus is settled: mailbox calls block the ProcessData
+        # thread, and a burst of them right after bring-up trips the slave's
+        # SM watchdog before it ever runs a clean cycle.
+        self.settle_time_s = 2.0
+        self.settled = threading.Event()
+        self._clean_since = None
 
     # ------------------------------------------------------------------
     # Context manager
@@ -847,24 +909,76 @@ class EtherCATBus:
         adapter = self._resolve_adapter(self.adapter)
         print(f"[BUS] Connecting to: {adapter.name}")
 
+        self._open_master(adapter.name)
+        print(f"[BUS] Found {len(self.master.slaves)} EtherCAT slave(s)")
+        self._bring_up(start_threads=True)
+
+    # ------------------------------------------------------------------
+    # Bring-up steps (shared by open() and _attempt_reconnect())
+    # ------------------------------------------------------------------
+    # Subclasses may override the individual steps, e.g. `_configure_pdos`
+    # for slaves that need a non-standard mapping sequence.
+
+    def _open_master(self, adapter_name):
+        """Create the pysoem master and scan the bus (INIT -> PRE-OP)."""
+        self.settled.clear()
+        self._clean_since = None
         self.master = pysoem.Master()
-        self.master.open(adapter.name)
+        self.master.open(adapter_name)
         self.master.in_op = False
         self.master.do_check_state = False
-
         if self.master.config_init() <= 0:
             raise ConnectionError("No EtherCAT slaves found")
-
+        if self.sdo_read_timeout_us is not None:
+            self.master.sdo_read_timeout = self.sdo_read_timeout_us
+        if self.sdo_write_timeout_us is not None:
+            self.master.sdo_write_timeout = self.sdo_write_timeout_us
         register_emergency_callbacks(self.master)
-
-        print(f"[BUS] Found {len(self.master.slaves)} EtherCAT slave(s)")
-
         for slave in self.master.slaves:
             slave.is_lost = False
 
+    def _bring_up(self, start_threads):
+        """PRE-OP -> SAFE-OP -> OP for a freshly scanned master.
+
+        With ``start_threads=True`` (initial open) the cyclic threads are
+        started before OP is requested.  With ``False`` (reconnect) the
+        threads are already running but idle while ``_reconnecting`` is
+        set, so :meth:`_reach_op` pumps the process data itself.
+        """
         # CoE Init->PreOP startup writes (e.g. EL2574 revision/diag) before mapping.
         self._apply_startup_sdos("IP")
+        self._configure_pdos()
+        # CoE PreOP->SafeOP startup writes (e.g. EL2574 0xF030 slot config) after
+        # the PDO assignment and before config_map() so process data is sized.
+        self._apply_startup_sdos("PS")
+        self._map_io()
 
+        if self.master.state_check(pysoem.SAFEOP_STATE, 50000) != pysoem.SAFEOP_STATE:
+            details = self._slave_state_report()
+            raise ConnectionError(f"Failed to reach SAFE-OP state.\n{details}")
+        print("[BUS] Reached SAFE-OP state")
+
+        self._configure_dc()
+
+        with self._lock:
+            for handle in self._slaves:
+                handle.seed_tx(self.master.slaves[handle.slave_index])
+
+        if start_threads:
+            self._start_threads()
+        try:
+            self._reach_op(pump=not start_threads)
+        except Exception:
+            if start_threads:
+                self._stop_threads()
+            raise
+
+        self.master.in_op = True
+        self._last_op_seen = time.monotonic()
+        print("[BUS] Reached OP state — bus ready")
+
+    def _configure_pdos(self):
+        """Write the CoE PDO assignment for every slave (in PRE-OP)."""
         with self._lock:
             for handle in self._slaves:
                 try:
@@ -912,17 +1026,18 @@ class EtherCATBus:
             except Exception:
                 pass
 
-        # CoE PreOP->SafeOP startup writes (e.g. EL2574 0xF030 slot config) after
-        # the PDO assignment and before config_map() so process data is sized.
-        self._apply_startup_sdos("PS")
-
+    def _map_io(self):
+        """Build the process-data image (``config_map``)."""
         try:
             self.master.config_map()
         except Exception as exc:
-            details = self._slave_state_report()
-            raise ConfigurationError(
-                f"config_map() failed: {exc}. {details}"
-            ) from exc
+            if self.config_map_error_filter is not None and self.config_map_error_filter(exc):
+                print(f"[BUS] config_map() reported tolerated errors: {exc}")
+            else:
+                details = self._slave_state_report()
+                raise ConfigurationError(
+                    f"config_map() failed: {exc}. {details}"
+                ) from exc
 
         print("[BUS] I/O map after config_map():")
         for i, slave in enumerate(self.master.slaves):
@@ -931,43 +1046,45 @@ class EtherCATBus:
             name = slave.name if isinstance(slave.name, str) else slave.name.decode("utf-8", errors="replace")
             print(f"  [{i}] {name}: Out={out_sz}B, In={in_sz}B")
 
-        if self.master.state_check(pysoem.SAFEOP_STATE, 50000) != pysoem.SAFEOP_STATE:
-            details = self._slave_state_report()
-            raise ConnectionError(
-                f"Failed to reach SAFE-OP state.\n{details}"
-            )
-        print("[BUS] Reached SAFE-OP state")
+    def _configure_dc(self):
+        """Enable DC Sync0 on every slave when ``dc_sync0_cycle_ns`` is set."""
+        if not self.dc_sync0_cycle_ns:
+            return
+        cycle_ns = int(self.dc_sync0_cycle_ns)
+        for i, slave in enumerate(self.master.slaves):
+            slave.dc_sync(1, cycle_ns)
+            print(f"[BUS] Slave {i}: DC Sync0 enabled, cycle={cycle_ns} ns")
 
-        with self._lock:
-            for handle in self._slaves:
-                handle.seed_tx(self.master.slaves[handle.slave_index])
+    def _reach_op(self, pump):
+        """Request OP up to ``op_attempts`` times, ``op_timeout_s`` each.
 
-        self._start_threads()
-
-        self.master.state = pysoem.OP_STATE
-        self.master.write_state()
-        print("[BUS] Requested OP state transition...")
-
-        # Poll with short state_check timeouts so the ProcessData thread
-        # can keep feeding the slave watchdog between checks.  A single
-        # 50 ms state_check holds the GIL and starves the cyclic frames.
-        reached_op = False
-        deadline = time.perf_counter() + 5.0
-        while time.perf_counter() < deadline:
-            if self.master.state_check(pysoem.OP_STATE, 1000) == pysoem.OP_STATE:
-                reached_op = True
-                break
-            time.sleep(0.001)
-
-        if not reached_op:
-            self._stop_threads()
-            details = self._slave_state_report()
-            raise ConnectionError(
-                f"Failed to reach OP state.\n{details}"
-            )
-
-        self.master.in_op = True
-        print("[BUS] Reached OP state — bus ready")
+        Polls with short ``state_check`` timeouts so the ProcessData thread
+        can keep feeding the slave watchdog between checks — a single 50 ms
+        state_check holds the GIL and starves the cyclic frames.  With
+        ``pump=True`` the frames are sent from here instead (the cyclic
+        threads are parked during a reconnect); slaves refuse OP without
+        valid process data.
+        """
+        attempts = max(1, int(self.op_attempts))
+        for attempt in range(1, attempts + 1):
+            self.master.state = pysoem.OP_STATE
+            self.master.write_state()
+            print(f"[BUS] Requested OP state transition ({attempt}/{attempts})...")
+            deadline = time.perf_counter() + self.op_timeout_s
+            while time.perf_counter() < deadline:
+                if pump:
+                    self.master.send_processdata(**_SEND_PD_KWARGS)
+                    self.master.receive_processdata(10000, **_RECV_PD_KWARGS)
+                if self.master.state_check(pysoem.OP_STATE, 1000) == pysoem.OP_STATE:
+                    return
+                time.sleep(0.005 if pump else 0.001)
+            if attempt < attempts:
+                print(f"[BUS] OP not reached: {self._slave_state_report()}")
+                time.sleep(0.5)
+        raise ConnectionError(
+            f"Failed to reach OP state after {attempts} attempt(s).\n"
+            f"{self._slave_state_report()}"
+        )
 
     _AL_STATUS_CODES = {
         0x0000: "No error",
@@ -1106,6 +1223,7 @@ class EtherCATBus:
 
         if self.master:
             self.master.in_op = False
+        self.settled.clear()
 
         self._stop_threads()
 
@@ -1318,6 +1436,72 @@ class EtherCATBus:
                 update_timing(stats, "pdo", t_now - t_start, cycle_s)
                 t_start = t_now
 
+    _RECOVERABLE_STATES = (pysoem.SAFEOP_STATE,
+                           pysoem.SAFEOP_STATE + pysoem.STATE_ERROR)
+
+    def is_clean(self):
+        """True while the bus is in OP and every PDO datagram is answered.
+
+        A slave that dropped to SAFE-OP disables its output SyncManager, so
+        the working counter falls short of the expected value even though
+        frames are still flowing.
+        """
+        master = self.master
+        return (master is not None and master.in_op
+                and not self._reconnecting.is_set()
+                and self._actual_wkc >= master.expected_wkc)
+
+    def wait_settled(self, timeout=None):
+        """Block until :attr:`settled` is set (see ``__init__``)."""
+        return self.settled.wait(timeout)
+
+    def _update_settled(self, now):
+        if not self.is_clean():
+            self._clean_since = None
+            return
+        if self._clean_since is None:
+            self._clean_since = now
+        elif not self.settled.is_set() and now - self._clean_since >= self.settle_time_s:
+            self.settled.set()
+            print(f"[BUS] Settled — all slaves clean in OP for {self.settle_time_s:.0f}s")
+
+    def _check_once(self, consecutive_lost):
+        """One state-check tick.  Returns the updated lost counter."""
+        now = time.monotonic()
+        try:
+            if self.master and self.master.in_op and (
+                (self._actual_wkc < self.master.expected_wkc)
+                or self.master.do_check_state
+            ):
+                self.master.do_check_state = False
+                self.master.read_state()
+
+                all_ok = True
+                recoverable = True
+                for i, slave in enumerate(self.master.slaves):
+                    if slave.state != pysoem.OP_STATE:
+                        all_ok = False
+                        recoverable = recoverable and slave.state in self._RECOVERABLE_STATES
+                        self.master.do_check_state = True
+                        self._recover_slave(slave, i)
+
+                if not self.master.do_check_state:
+                    consecutive_lost = 0
+                    self._last_op_seen = now
+                elif not all_ok:
+                    in_grace = now - self._last_op_seen < self.recover_grace_s
+                    if not (recoverable and in_grace):
+                        consecutive_lost += 1
+            else:
+                consecutive_lost = 0
+                self._last_op_seen = now
+        except Exception as exc:
+            consecutive_lost += 1
+            print(f"[BUS] State check failed ({consecutive_lost}): "
+                  f"{type(exc).__name__}: {exc}")
+        self._update_settled(now)
+        return consecutive_lost
+
     def _check_loop(self):
         """Monitor slave health and attempt recovery — 300 ms cycle."""
         _consecutive_lost = 0
@@ -1332,29 +1516,7 @@ class EtherCATBus:
                 t_next = time.perf_counter()
                 continue
 
-            try:
-                if self.master and self.master.in_op and (
-                    (self._actual_wkc < self.master.expected_wkc)
-                    or self.master.do_check_state
-                ):
-                    self.master.do_check_state = False
-                    self.master.read_state()
-
-                    all_ok = True
-                    for i, slave in enumerate(self.master.slaves):
-                        if slave.state != pysoem.OP_STATE:
-                            all_ok = False
-                            self.master.do_check_state = True
-                            self._recover_slave(slave, i)
-
-                    if not self.master.do_check_state:
-                        _consecutive_lost = 0
-                    elif not all_ok:
-                        _consecutive_lost += 1
-                else:
-                    _consecutive_lost = 0
-            except Exception:
-                _consecutive_lost += 1
+            _consecutive_lost = self._check_once(_consecutive_lost)
 
             if (
                 _consecutive_lost >= _RECONNECT_THRESHOLD
@@ -1376,116 +1538,68 @@ class EtherCATBus:
     def _attempt_reconnect(self):
         """Tear down the master and rebuild from scratch."""
         self._reconnecting.set()
+        self.settled.clear()
+        self._clean_since = None
         self.master.in_op = False
         print("[BUS] Connection lost — attempting reconnect ...")
+        self._call_hook(self.on_connection_lost)
         time.sleep(0.1)
 
-        try:
-            self.master.close()
-        except Exception:
-            pass
+        # `reconnect_lock` is held while the master is closed, replaced and
+        # brought up, so application threads that share the same lock never
+        # run an SDO/FoE on a master that is being torn down (a use-after-free
+        # in native code).  An SDO in flight is waited for first.
+        lock = self.reconnect_lock if self.reconnect_lock is not None else nullcontext()
+
+        with lock:
+            try:
+                self.master.close()
+            except Exception:
+                pass
 
         backoff = 1.0
         while not self._check_stop.is_set():
             try:
-                adapter = self._resolve_adapter(self.adapter)
-                self.master = pysoem.Master()
-                self.master.open(adapter.name)
-                self.master.in_op = False
-                self.master.do_check_state = False
+                with lock:
+                    adapter = self._resolve_adapter(self.adapter)
+                    self._open_master(adapter.name)
+                    print(f"[BUS] Found {len(self.master.slaves)} EtherCAT slave(s)")
+                    self._bring_up(start_threads=False)
 
-                if self.master.config_init() <= 0:
-                    raise CommunicationError("No EtherCAT slaves found")
+                    self._comm_error_count = 0
+                    # Stale value from the dead master; the ProcessData thread
+                    # overwrites it on its first cycle.
+                    self._actual_wkc = self.master.expected_wkc
 
-                register_emergency_callbacks(self.master)
+                    with self._lock:
+                        for handle in self._slaves:
+                            handle.on_reconnect(self.master)
 
-                for slave in self.master.slaves:
-                    slave.is_lost = False
-
-                self._apply_startup_sdos("IP")
-
-                with self._lock:
-                    for handle in self._slaves:
-                        rx, tx = get_slave_pdo(self.pdo_config, handle.slave_index)
-                        handle.configure(self.master.slaves[handle.slave_index],
-                                         rx_pdo=rx, tx_pdo=tx)
-
-                registered = {h.slave_index for h in self._slaves}
-                for idx, slave in enumerate(self.master.slaves):
-                    if idx in registered:
-                        continue
-                    try:
-                        rx, tx = get_slave_pdo(self.pdo_config, idx)
-                        if not (rx or tx):
-                            continue
-                        if not (slave_supports_coe_pdo_mapping(slave)
-                                or slave_supports_pdo_assignment(slave)):
-                            continue
-                        configure_pdo_mapping(slave, rx_pdo=rx, tx_pdo=tx)
-                    except Exception as exc:
-                        raise CommunicationError(
-                            f"PDO mapping failed for slave {idx}: {exc}"
-                        ) from exc
-
-                for slave in self.master.slaves:
-                    if not slave_supports_coe_pdo_mapping(slave):
-                        continue
-                    try:
-                        sanitize_invalid_pdo_assignments(slave)
-                    except Exception:
-                        pass
-
-                self._apply_startup_sdos("PS")
-
-                self.master.config_map()
-
-                if self.master.state_check(
-                    pysoem.SAFEOP_STATE, 50000
-                ) != pysoem.SAFEOP_STATE:
-                    raise CommunicationError("Failed to reach SAFE-OP")
-
-                with self._lock:
-                    for handle in self._slaves:
-                        handle.seed_tx(self.master.slaves[handle.slave_index])
-
-                self.master.state = pysoem.OP_STATE
-                self.master.write_state()
-
-                deadline = time.time() + 5.0
-                reached_op = False
-                while time.time() < deadline:
-                    self.master.send_processdata(**_SEND_PD_KWARGS)
-                    self.master.receive_processdata(10000, **_RECV_PD_KWARGS)
-                    if self.master.state_check(
-                        pysoem.OP_STATE, 1000
-                    ) == pysoem.OP_STATE:
-                        reached_op = True
-                        break
-                    time.sleep(0.005)
-
-                if not reached_op:
-                    raise CommunicationError("Failed to reach OP")
-
-                self.master.in_op = True
-                self._comm_error_count = 0
-
-                with self._lock:
-                    for handle in self._slaves:
-                        handle.on_reconnect(self.master)
-
-                self._reconnecting.clear()
+                    self._reconnecting.clear()
                 print("[BUS] Successfully reconnected")
+                self._call_hook(self.on_reconnected)
                 return
 
             except Exception as exc:
                 print(f"[BUS] Reconnect attempt failed: {exc} — retrying in {backoff:.0f}s")
-                try:
-                    self.master.close()
-                except Exception:
-                    pass
-                self.master = None
+                with lock:
+                    try:
+                        self.master.close()
+                    except Exception:
+                        pass
+                    self.master = None
                 self._check_stop.wait(backoff)
                 backoff = min(backoff * 2, 10.0)
+
+    @staticmethod
+    def _call_hook(hook):
+        if hook is None:
+            return
+        try:
+            hook()
+        except Exception as exc:
+            print(f"[BUS] Hook {getattr(hook, '__name__', hook)} failed: "
+                  f"{type(exc).__name__}: {exc}")
 
     @staticmethod
     def _recover_slave(slave, pos):

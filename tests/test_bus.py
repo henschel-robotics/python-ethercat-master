@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import pysoem
 import pytest
 
 from ethercat_master.bus import (
@@ -114,6 +115,220 @@ def test_processdata_loop_handles_none_master_during_reconnect():
     bus._pd_stop.set()
     thread.join(timeout=1.0)
     assert not thread.is_alive()
+
+
+def _bus_with_slave(state, actual_wkc, expected_wkc=3):
+    bus = EtherCATBus()
+    bus._recover_slave = MagicMock()
+    slave = MagicMock()
+    slave.state = state
+    master = MagicMock()
+    master.in_op = True
+    master.do_check_state = False
+    master.expected_wkc = expected_wkc
+    master.slaves = [slave]
+    bus.master = master
+    bus._actual_wkc = actual_wkc
+    return bus, slave
+
+
+def test_check_once_recoverable_drop_within_grace_does_not_count():
+    """SAFE-OP+ERROR (SM watchdog) right after OP is a recovery in progress."""
+    bus, slave = _bus_with_slave(pysoem.SAFEOP_STATE + pysoem.STATE_ERROR, actual_wkc=1)
+    bus._last_op_seen = time.monotonic()
+    lost = bus._check_once(0)
+    assert lost == 0
+    bus._recover_slave.assert_called_once_with(slave, 0)
+
+
+def test_check_once_recoverable_drop_after_grace_counts():
+    bus, _ = _bus_with_slave(pysoem.SAFEOP_STATE, actual_wkc=1)
+    bus._last_op_seen = time.monotonic() - bus.recover_grace_s - 1.0
+    assert bus._check_once(0) == 1
+
+
+def test_check_once_lost_slave_counts_immediately():
+    bus, _ = _bus_with_slave(pysoem.NONE_STATE, actual_wkc=-1)
+    bus._last_op_seen = time.monotonic()
+    assert bus._check_once(3) == 4
+
+
+def test_check_once_op_resets_counter_and_marks_op_seen():
+    bus, _ = _bus_with_slave(pysoem.OP_STATE, actual_wkc=1)
+    bus._last_op_seen = 0.0
+    assert bus._check_once(5) == 0
+    assert bus._last_op_seen > 0.0
+    bus._recover_slave.assert_not_called()
+
+
+def test_settled_requires_clean_bus_for_settle_time():
+    bus, _ = _bus_with_slave(pysoem.OP_STATE, actual_wkc=3)
+    bus.settle_time_s = 0.05
+    bus._check_once(0)
+    assert not bus.settled.is_set()
+    time.sleep(0.1)
+    bus._check_once(0)
+    assert bus.settled.is_set()
+    assert bus.wait_settled(timeout=0)
+
+
+def test_settled_resets_when_wkc_drops():
+    bus, slave = _bus_with_slave(pysoem.OP_STATE, actual_wkc=3)
+    bus.settle_time_s = 0.05
+    bus._check_once(0)
+    time.sleep(0.03)
+    bus._actual_wkc = 1
+    slave.state = pysoem.SAFEOP_STATE + pysoem.STATE_ERROR
+    bus._check_once(0)
+    assert bus._clean_since is None
+    bus._actual_wkc = 3
+    slave.state = pysoem.OP_STATE
+    bus._check_once(0)
+    time.sleep(0.03)
+    bus._check_once(0)
+    assert not bus.settled.is_set()
+
+
+def _mock_master(n_slaves=1):
+    master = MagicMock()
+    master.slaves = [MagicMock(name=f"slave{i}") for i in range(n_slaves)]
+    for s in master.slaves:
+        s.name = "S"
+        s.output = b"\x00" * 4
+        s.input = b"\x00" * 4
+    master.state_check = MagicMock(return_value=pysoem.OP_STATE)
+    return master
+
+
+def test_configure_dc_disabled_by_default():
+    bus = EtherCATBus()
+    bus.master = _mock_master()
+    bus._configure_dc()
+    bus.master.slaves[0].dc_sync.assert_not_called()
+
+
+def test_configure_dc_enables_sync0_on_all_slaves():
+    bus = EtherCATBus(dc_sync0_cycle_ns=714_285.7)
+    bus.master = _mock_master(n_slaves=2)
+    bus._configure_dc()
+    for s in bus.master.slaves:
+        s.dc_sync.assert_called_once_with(1, 714285)
+
+
+def test_map_io_raises_configuration_error_without_filter():
+    from ethercat_master.exceptions import ConfigurationError
+    bus = EtherCATBus()
+    bus.master = _mock_master()
+    bus.master.config_map.side_effect = RuntimeError("boom")
+    bus._slave_state_report = MagicMock(return_value="")
+    with pytest.raises(ConfigurationError):
+        bus._map_io()
+
+
+def test_map_io_filter_tolerates_error():
+    seen = []
+    bus = EtherCATBus(config_map_error_filter=lambda exc: seen.append(exc) or True)
+    bus.master = _mock_master()
+    bus.master.config_map.side_effect = RuntimeError("0x1C00")
+    bus._map_io()
+    assert len(seen) == 1
+
+
+def test_reach_op_retries_then_succeeds():
+    bus = EtherCATBus(op_attempts=3, op_timeout_s=0.01)
+    bus.master = _mock_master()
+    bus._slave_state_report = MagicMock(return_value="")
+    # The slave only accepts OP once it has been requested a second time.
+    master = bus.master
+    master.state_check.side_effect = lambda *_: (
+        pysoem.OP_STATE if master.write_state.call_count >= 2 else pysoem.SAFEOP_STATE)
+    start = time.perf_counter()
+    bus._reach_op(pump=False)
+    assert master.write_state.call_count == 2
+    assert time.perf_counter() - start < 2.0
+
+
+def test_reach_op_pump_sends_processdata_and_raises_after_attempts():
+    from ethercat_master.exceptions import ConnectionError as BusConnectionError
+    bus = EtherCATBus(op_attempts=2, op_timeout_s=0.01)
+    bus.master = _mock_master()
+    bus.master.state_check.return_value = pysoem.SAFEOP_STATE
+    bus._slave_state_report = MagicMock(return_value="")
+    with pytest.raises(BusConnectionError):
+        bus._reach_op(pump=True)
+    assert bus.master.write_state.call_count == 2
+    assert bus.master.send_processdata.called
+    assert bus.master.receive_processdata.called
+
+
+def test_open_master_applies_sdo_timeouts():
+    bus = EtherCATBus(sdo_read_timeout_us=20_000_000, sdo_write_timeout_us=60_000_000)
+    master = _mock_master()
+    master.config_init.return_value = 1
+    import ethercat_master.bus as busmod
+    orig_master = busmod.pysoem.Master
+    orig_cb = busmod.register_emergency_callbacks
+    busmod.pysoem.Master = lambda: master
+    busmod.register_emergency_callbacks = MagicMock()
+    try:
+        bus._open_master("adapter")
+    finally:
+        busmod.pysoem.Master = orig_master
+        busmod.register_emergency_callbacks = orig_cb
+    assert master.sdo_read_timeout == 20_000_000
+    assert master.sdo_write_timeout == 60_000_000
+    assert master.slaves[0].is_lost is False
+
+
+def test_call_hook_swallows_exceptions():
+    calls = []
+
+    def ok():
+        calls.append("ok")
+
+    def bad():
+        raise RuntimeError("nope")
+
+    EtherCATBus._call_hook(None)
+    EtherCATBus._call_hook(ok)
+    EtherCATBus._call_hook(bad)
+    assert calls == ["ok"]
+
+
+def test_reconnect_lock_and_hooks_used():
+    """_attempt_reconnect holds reconnect_lock around teardown/bring-up and
+    fires on_connection_lost / on_reconnected."""
+    events = []
+
+    class Lock:
+        def __enter__(self):
+            events.append("lock")
+
+        def __exit__(self, *a):
+            events.append("unlock")
+
+    bus = EtherCATBus(reconnect_lock=Lock(),
+                      on_connection_lost=lambda: events.append("lost"),
+                      on_reconnected=lambda: events.append("reconnected"))
+    bus._check_stop = threading.Event()
+    bus.master = _mock_master()
+    bus._resolve_adapter = MagicMock(return_value=MagicMock(name="adp"))
+    bus._open_master = MagicMock(side_effect=lambda name: setattr(bus, "master", _mock_master()))
+    bus._bring_up = MagicMock()
+
+    orig_sleep = time.sleep
+    time.sleep = lambda s: None
+    try:
+        bus._attempt_reconnect()
+    finally:
+        time.sleep = orig_sleep
+
+    assert events[0] == "lost"
+    assert events[-1] == "reconnected"
+    # close + bring-up each wrapped in the lock
+    assert events.count("lock") == 2 and events.count("unlock") == 2
+    assert not bus._reconnecting.is_set()
+    bus._bring_up.assert_called_once_with(start_threads=False)
 
 
 def _write_config(tmp_path: Path, network: dict, slaves: dict | None = None) -> Path:
