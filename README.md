@@ -4,7 +4,7 @@ Generic EtherCAT master library built directly on [SOEM 2.x](https://github.com/
 
 Developed by [Henschel Robotics GmbH](https://henschel-robotics.ch).
 
-![EtherCAT Master Web GUI](https://raw.githubusercontent.com/henschel-robotics/python-ethercat-master/master/docs/images/01-bus-overview.png)
+![EtherCAT Master Web GUI](docs/images/01-bus-overview.png)
 
 ## Features
 
@@ -219,19 +219,17 @@ On **Windows**, omit `sudo` (Npcap provides raw Ethernet access for the current 
 
 Then open `http://localhost:8080` in your browser.
 
-![EtherCAT Master Web GUI](https://raw.githubusercontent.com/henschel-robotics/python-ethercat-master/master/docs/images/01-bus-overview.png)
-
 The web GUI lets you:
 
 - Select a network adapter
 - Scan the bus and discover **any EtherCAT device** — Beckhoff terminals, IO modules, servo drives, and more
 - Configure PDO assignments per slave
 - Set the cycle time and go to OP state
-- Run network latency tests (SDO round-trip measurement with histogram)
+- Measure SDO round-trip latency (statistics and histogram)
 
-| Mixed bus (Beckhoff + HDrive) | Network Latency Test |
+| Mixed bus (Beckhoff + HDrive) | SDO latency in OP |
 |---|---|
-| ![Mixed Bus](https://raw.githubusercontent.com/henschel-robotics/python-ethercat-master/master/docs/images/03-bus-discovery-mixed.png) | ![Network Test](https://raw.githubusercontent.com/henschel-robotics/python-ethercat-master/master/docs/images/02-network-test.png) |
+| ![Mixed Bus](docs/images/03-bus-discovery-mixed.png) | ![Network Test](docs/images/02-network-test.png) |
 
 > **Full guide:** [`docs/web-interface.md`](docs/web-interface.md)
 
