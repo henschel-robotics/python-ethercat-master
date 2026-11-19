@@ -73,6 +73,21 @@ jobs:
 
       - run: python -m pytest tests -q
 
+  # Reports lint findings without blocking the release. Broad `except
+  # Exception:` blocks and the mutable _AL_STATUS_CODES dict are intentional
+  # for fault tolerance — see AGENTS.md.
+  lint:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install --quiet ruff
+
       - run: ruff check ethercat_master tests benchmarks
 
   # One universal wheel: it ships libecm.so + libecm.dll and _soem picks the
