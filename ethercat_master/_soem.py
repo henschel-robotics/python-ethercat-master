@@ -4,6 +4,7 @@ import ctypes
 import os
 import sys
 import threading
+import warnings
 from collections import namedtuple
 
 NONE_STATE = 0x00
@@ -191,6 +192,10 @@ try:  # object dictionary (SDO info), missing in older shim builds
     _ecm_oe_get = _sig("ecm_oe_get", None, _P, _I, _IP, _IP, _IP, ctypes.c_char_p)
 except AttributeError:
     _ecm_od_list = None
+try:  # FPWR register write, missing in older shim builds
+    _ecm_fpwr = _sig("ecm_fpwr", _I, _P, _I, _I, ctypes.c_char_p, _I, _I)
+except AttributeError:
+    _ecm_fpwr = None
 _NAME_LEN = 41
 _OBJ_CODE_VAR = 7
 
@@ -311,6 +316,10 @@ class Master:
         self._sdo_rd = 0
         self._sdo_wr = 0
         self.state = NONE_STATE
+        # pysoem exposes these as plain attributes; keep the same defaults so
+        # callers may read them before the bus state machine assigns them.
+        self.in_op = False
+        self.do_check_state = False
 
     def __del__(self):
         h, self._h = getattr(self, "_h", None), None
@@ -556,3 +565,56 @@ class Slave:
         if wkc <= 0:
             raise WkcError(wkc)
         return bytes(buf)
+
+    def write_reg(self, address, data, timeout=2000):
+        if _ecm_fpwr is None:
+            raise NotImplementedError("libecm without FPWR support, rebuild the shim")
+        data = bytes(data)
+        wkc = _ecm_fpwr(self._h, self._pos, address, data, len(data), timeout)
+        if wkc <= 0:
+            raise WkcError(wkc)
+
+    _WD_DIV_REG = 0x0400
+    _WD_REGS = {"pdi": 0x0410, "processdata": 0x0420}
+    _WD_TIMEOUT_US = 4000
+
+    def _get_watchdog_divider_ns(self):
+        wd_div_reg = int.from_bytes(
+            self.read_reg(self._WD_DIV_REG, 2, self._WD_TIMEOUT_US), "little")
+        return 40 * (wd_div_reg + 2)
+
+    def get_max_watchdog_time(self):
+        """Maximum watchdog timeout in ms (like ``pysoem.Slave``)."""
+        return 0xFFFF * self._get_watchdog_divider_ns() / 1_000_000.0
+
+    def get_watchdog(self, wd_type):
+        """Watchdog time of the 'pdi' or 'processdata' watchdog in ms."""
+        reg = self._WD_REGS.get(wd_type)
+        if reg is None:
+            raise AttributeError(wd_type)
+        wd_div_ns = self._get_watchdog_divider_ns()
+        wd_time_reg = int.from_bytes(
+            self.read_reg(reg, 2, self._WD_TIMEOUT_US), "little")
+        return wd_time_reg * wd_div_ns / 1_000_000.0
+
+    def set_watchdog(self, wd_type, wd_time_ms):
+        """Set the 'pdi' or 'processdata' watchdog time in ms.
+
+        Resolution is limited by the ESC watchdog divider (default ~0.1 ms);
+        warns when the hardware-rounded value differs from the request.
+        """
+        reg = self._WD_REGS.get(wd_type)
+        if reg is None:
+            raise AttributeError(wd_type)
+        limit = self.get_max_watchdog_time()
+        if wd_time_ms > limit:
+            raise AttributeError(f"wd_time_ms is limited to {limit} ms")
+        wd_div_ns = self._get_watchdog_divider_ns()
+        wd_time_reg = int(wd_time_ms * 1_000_000.0 / wd_div_ns)
+        self.write_reg(reg, wd_time_reg.to_bytes(2, "little"), self._WD_TIMEOUT_US)
+        actual_wd_time_ms = wd_time_reg * wd_div_ns / 1_000_000.0
+        if actual_wd_time_ms != wd_time_ms:
+            warnings.warn(
+                f"The actual set watchdog time ({actual_wd_time_ms} ms) differs "
+                f"from the requested watchdog time ({wd_time_ms} ms) due to "
+                "resolution limits of the hardware!", UserWarning)

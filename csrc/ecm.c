@@ -251,3 +251,8 @@ ECM_API int ecm_fprd(ecm_master *m, int slave, int ado, uint8 *buf, int len, int
 {
    return ecx_FPRD(&m->ctx.port, m->ctx.slavelist[slave].configadr, (uint16)ado, (uint16)len, buf, timeout_us);
 }
+
+ECM_API int ecm_fpwr(ecm_master *m, int slave, int ado, const uint8 *buf, int len, int timeout_us)
+{
+   return ecx_FPWR(&m->ctx.port, m->ctx.slavelist[slave].configadr, (uint16)ado, (uint16)len, (uint8 *)buf, timeout_us);
+}

@@ -1,0 +1,135 @@
+# Builds the SOEM shim for Linux + Windows, runs tests, packages the
+# wheel/sdist and publishes to PyPI on version tags via trusted publishing
+# (OIDC — no API token needed).
+#
+# PyPI setup (once, on pypi.org -> Publishing -> GitHub):
+#   owner = henschel-robotics, repository = python-ethercat-master,
+#   workflow filename = release.yml, environment = pypi
+# Fallback without OIDC: create a repository secret PYPI_API_TOKEN and replace
+# the gh-action-pypi-publish step with
+#   - run: pip install twine && twine upload --non-interactive -u __token__ -p "$PYPI_API_TOKEN" dist/*
+#     env: { PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }} }
+
+name: release
+
+on:
+  push:
+    tags: ["v*", "[0-9]*.[0-9]*.[0-9]*"]
+  workflow_dispatch:
+
+env:
+  LLVM_MINGW_VERSION: "20261117"
+  LLVM_MINGW_DIR: "llvm-mingw-20261117-ucrt-ubuntu-22.04-x86_64"
+
+jobs:
+  # Compiles libecm.so (host gcc) and libecm.dll (llvm-mingw cross-compile).
+  natives:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install --quiet cmake ninja
+
+      - name: Install llvm-mingw
+        run: |
+          curl -fsSL "https://github.com/mstorsjo/llvm-mingw/releases/download/${LLVM_MINGW_VERSION}/${LLVM_MINGW_DIR}.tar.xz" | sudo tar -xJ -C /opt
+          echo "/opt/${LLVM_MINGW_DIR}/bin" >> "$GITHUB_PATH"
+
+      - name: Build libecm.so (Linux)
+        run: |
+          cmake -B build-linux -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-linux --target ecm
+          cp build-linux/libecm.so ethercat_master/
+
+      - name: Build libecm.dll (Windows cross-compile)
+        run: |
+          cmake -B build-win -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=ci/mingw-toolchain.cmake
+          cmake --build build-win --target ecm
+          cp build-win/libecm.dll ethercat_master/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: natives
+          path: |
+            ethercat_master/libecm.so
+            ethercat_master/libecm.dll
+          retention-days: 7
+
+  # Editable install rebuilds the shim for the host, then run the test suite.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install --quiet -e .[dev]
+
+      - run: python -m pytest tests -q
+
+      - run: ruff check ethercat_master tests benchmarks
+
+  # One universal wheel: it ships libecm.so + libecm.dll and _soem picks the
+  # right one per platform. The sdist includes csrc/ + third_party/SOEM.
+  package:
+    runs-on: ubuntu-latest
+    needs: [natives, test]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: natives
+          path: ethercat_master/
+
+      - run: pip install --quiet build
+
+      - run: python ci/make_wheel.py
+
+      - run: python -m build --sdist --outdir dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          retention-days: 7
+
+  # Publish on version tags (v0.2.0 / 0.2.0 must match project.version).
+  publish:
+    runs-on: ubuntu-latest
+    needs: package
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Check tag matches project.version
+        run: |
+          V=$(python -c "import tomllib;print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          if [ "${GITHUB_REF_NAME#v}" != "$V" ]; then
+            echo "Tag '$GITHUB_REF_NAME' does not match pyproject version '$V'" >&2
+            exit 1
+          fi
+
+      - uses: pypa/gh-action-pypi-publish@release/v1

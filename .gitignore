@@ -15,8 +15,12 @@ htmlcov/
 # Packaging (build, scikit-build-core, cibuildwheel)
 dist/
 build/
+build-*/
 _skbuild/
 wheelhouse/
+
+# Local llvm-mingw toolchain (see .github/workflows/release.yml)
+.llvm-mingw/
 
 # CMake
 CMakeCache.txt

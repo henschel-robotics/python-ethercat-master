@@ -2,7 +2,7 @@
 EtherCAT Master
 ~~~~~~~~~~~~~~~
 
-Generic EtherCAT master library built on PySOEM.  Provides bus management,
+Generic EtherCAT master library built on SOEM 2.x.  Provides bus management,
 slave discovery, PDO mapping configuration, and automatic reconnection.
 
 Basic usage::
@@ -31,7 +31,14 @@ from .pdo import load_pdo_config, get_slave_pdo, configure_pdo_mapping
 from .exceptions import EtherCATError, ConnectionError, CommunicationError, ConfigurationError
 from .network_test import NetworkLatencyTest
 
-__version__ = "0.1.11"
+try:
+    from importlib.metadata import PackageNotFoundError, version as _pkg_version
+    try:
+        __version__ = _pkg_version("ethercat-master")
+    except PackageNotFoundError:
+        __version__ = "0.0.0.dev0"
+except ImportError:
+    __version__ = "0.0.0.dev0"
 __all__ = [
     "EtherCATBus",
     "register_emergency_callbacks",
