@@ -2,7 +2,7 @@
 EtherCAT Master — Bus Manager
 ===============================
 
-Provides :class:`EtherCATBus`, which owns the ``pysoem.Master`` and manages
+Provides :class:`EtherCATBus`, which owns the SOEM master (``_soem.Master``) and manages
 low-level EtherCAT communication for one or more slaves on a single adapter.
 
 Architecture
@@ -11,7 +11,7 @@ Architecture
 ::
 
     EtherCATBus
-    ├── pysoem.Master          (adapter handle)
+    ├── _soem.Master           (SOEM 2.x adapter handle, ctypes)
     ├── ProcessData thread     (default 1 ms — raw frame send/receive, configurable)
     ├── PDO Update thread      (configurable — decode RX, encode TX per slave)
     └── State Check thread     (300 ms — health monitoring, auto-reconnect)
@@ -47,7 +47,7 @@ import time
 from contextlib import nullcontext
 from pathlib import Path
 
-import pysoem
+from ._backend import pysoem
 
 from .exceptions import ConfigurationError, ConnectionError
 from .pdo import (
@@ -389,6 +389,24 @@ if "release_gil" in _inspect.signature(pysoem.Master.receive_processdata).parame
     _RECV_PD_KWARGS["release_gil"] = True
 
 
+def tolerate_sm_type_errors(exc):
+    """Default ``config_map_error_filter``: accept errors that only concern 0x1C00.
+
+    Some slaves (e.g. Hilscher netX based drives) do not answer SDO reads of
+    0x1C00 (Sync Manager Communication Type); SOEM's config_map() then reports
+    errors although the PDO assignment (0x1C12/0x1C13) itself is fine.
+    """
+    errors = getattr(exc, "error_list", None)
+    if errors is None and getattr(exc, "args", None) and isinstance(exc.args[0], list):
+        errors = exc.args[0]
+    if not errors:
+        return False
+    if all(getattr(e, "index", None) == 0x1C00 for e in errors):
+        print(f"[BUS] WARNING: 0x1C00 (SM communication type) not readable, ignored: {exc}")
+        return True
+    return False
+
+
 class EtherCATBus:
     """Manage an EtherCAT bus with one or more slaves.
 
@@ -540,7 +558,8 @@ class EtherCATBus:
         self.op_timeout_s = op_timeout_s
         self.sdo_read_timeout_us = sdo_read_timeout_us
         self.sdo_write_timeout_us = sdo_write_timeout_us
-        self.config_map_error_filter = config_map_error_filter
+        self.config_map_error_filter = (config_map_error_filter if config_map_error_filter is not None
+                                        else tolerate_sm_type_errors)
         self.reconnect_lock = reconnect_lock
         self.on_connection_lost = on_connection_lost
         self.on_reconnected = on_reconnected
@@ -687,7 +706,11 @@ class EtherCATBus:
                 apply_startup_sdos(slave, get_slave_startup(pdo_config, i),
                                    "PS", name=f"[{i}] {name}")
 
-            master.config_map()
+            try:
+                master.config_map()
+            except Exception as exc:
+                if not tolerate_sm_type_errors(exc):
+                    raise
 
             slaves = []
             for i, slave in enumerate(master.slaves):
