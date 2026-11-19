@@ -8,9 +8,9 @@ import time
 from pathlib import Path
 from unittest.mock import MagicMock
 
-import pysoem
 import pytest
 
+from ethercat_master._backend import pysoem
 from ethercat_master.bus import (
     EtherCATBus,
     _make_wait_deadline,

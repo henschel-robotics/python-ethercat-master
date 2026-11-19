@@ -2,7 +2,7 @@
 EtherCAT Master — Bus Manager
 ===============================
 
-Provides :class:`EtherCATBus`, which owns the ``pysoem.Master`` and manages
+Provides :class:`EtherCATBus`, which owns the SOEM master (``_soem.Master``) and manages
 low-level EtherCAT communication for one or more slaves on a single adapter.
 
 Architecture
@@ -11,7 +11,7 @@ Architecture
 ::
 
     EtherCATBus
-    ├── pysoem.Master          (adapter handle)
+    ├── _soem.Master           (SOEM 2.x adapter handle, ctypes)
     ├── ProcessData thread     (default 1 ms — raw frame send/receive, configurable)
     ├── PDO Update thread      (configurable — decode RX, encode TX per slave)
     └── State Check thread     (300 ms — health monitoring, auto-reconnect)
@@ -47,7 +47,7 @@ import time
 from contextlib import nullcontext
 from pathlib import Path
 
-import pysoem
+from ._backend import pysoem
 
 from .exceptions import ConfigurationError, ConnectionError
 from .pdo import (

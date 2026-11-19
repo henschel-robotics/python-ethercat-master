@@ -1,6 +1,6 @@
 # EtherCAT Master
 
-Generic EtherCAT master library built on [PySOEM](https://github.com/bnjmnp/pysoem). Provides bus management, slave discovery, configurable PDO mapping, automatic reconnection, and a built-in web interface for configuration.
+Generic EtherCAT master library built directly on [SOEM 2.x](https://github.com/OpenEtherCATsociety/SOEM) (bundled C shim, loaded via ctypes; no PySOEM needed). Provides bus management, slave discovery, configurable PDO mapping, automatic reconnection, and a built-in web interface for configuration.
 
 Developed by [Henschel Robotics GmbH](https://henschel-robotics.ch).
 
@@ -81,7 +81,16 @@ Open `http://<pi-ip>:8080` from any device on your network.
 ### Python
 
 - **Python 3.8+**
-- **PySOEM >= 1.1.0** -- Cython wrapper around [SOEM](https://github.com/OpenEtherCATsociety/SOEM) (installed automatically by pip)
+- **SOEM 2.0.1** -- vendored in `third_party/SOEM` and compiled into `ethercat_master/libecm` (`.so`/`.dll`) at build time
+- Building from source needs **CMake >= 3.16** and a C compiler (GCC/Clang, MSVC or MinGW-w64)
+- Optional legacy backend: `pip install ethercat-master[pysoem]` and set `ETHERCAT_MASTER_BACKEND=pysoem`
+
+### Building from source
+
+```bash
+pip install build
+python -m build --wheel          # builds SOEM + libecm via scikit-build-core
+```
 
 ## Installation
 
@@ -320,7 +329,7 @@ When `bus.open()` is called, three background threads are started:
 
 ## License
 
-This project is MIT-licensed -- see [pyproject.toml](pyproject.toml).
+This project is licensed under the **GNU General Public License v3.0 or later** -- see [LICENSE](LICENSE). It statically links SOEM 2.x, which is GPLv3 (or commercial from rt-labs).
 
 Copyright (c) Henschel Robotics GmbH
 
@@ -328,8 +337,7 @@ Copyright (c) Henschel Robotics GmbH
 
 | Component | License | Notes |
 |---|---|---|
-| [PySOEM](https://github.com/bnjmnp/pysoem) | MIT | Cython wrapper (installed via pip) |
-| [SOEM](https://github.com/OpenEtherCATsociety/SOEM) | **GPLv3 / Commercial** | Bundled inside PySOEM. As of SOEM 2.0 the license is GPLv3 or a commercial license from [rt-labs](https://rt-labs.com/). If GPLv3 is incompatible with your product, contact rt-labs for a commercial SOEM license. |
+| [SOEM](https://github.com/OpenEtherCATsociety/SOEM) | **GPLv3 / Commercial** | v2.0.1 vendored in `third_party/SOEM`, statically linked into `libecm`. GPLv3 or a commercial license from [rt-labs](https://rt-labs.com/). |
 | [Npcap](https://npcap.com/) (Windows only) | **Proprietary** | Free for personal use (≤ 5 installs). Commercial use or redistribution requires an [Npcap OEM license](https://npcap.com/oem/). |
 | [libpcap](https://www.tcpdump.org/) (Linux only) | BSD | Free for any use, no restrictions. |
 
