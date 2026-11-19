@@ -175,6 +175,99 @@ _ecm_dc_sync0 = _sig("ecm_dc_sync0", None, _P, _I, _I, ctypes.c_uint32, ctypes.c
 _ecm_dc_sync01 = _sig("ecm_dc_sync01", None, _P, _I, _I, ctypes.c_uint32, ctypes.c_uint32,
                       ctypes.c_int32)
 _ecm_fprd = _sig("ecm_fprd", _I, _P, _I, _I, _U8P, _I, _I)
+try:  # FoE is missing in shim builds older than this module
+    _ecm_foe_write = _sig("ecm_foe_write", _I, _P, _I, ctypes.c_char_p, ctypes.c_uint32,
+                          ctypes.c_char_p, _I, _I)
+    _ecm_foe_read = _sig("ecm_foe_read", _I, _P, _I, ctypes.c_char_p, ctypes.c_uint32,
+                         _U8P, ctypes.POINTER(_I), _I)
+except AttributeError:
+    _ecm_foe_write = _ecm_foe_read = None
+_IP = ctypes.POINTER(_I)
+try:  # object dictionary (SDO info), missing in older shim builds
+    _ecm_od_list = _sig("ecm_od_list", _I, _P, _I)
+    _ecm_od_index = _sig("ecm_od_index", _I, _P, _I)
+    _ecm_od_desc = _sig("ecm_od_desc", _I, _P, _I, _IP, _IP, _IP, ctypes.c_char_p)
+    _ecm_od_entries = _sig("ecm_od_entries", _I, _P, _I, _IP)
+    _ecm_oe_get = _sig("ecm_oe_get", None, _P, _I, _IP, _IP, _IP, ctypes.c_char_p)
+except AttributeError:
+    _ecm_od_list = None
+_NAME_LEN = 41
+_OBJ_CODE_VAR = 7
+
+
+class CoeObjectEntry:
+    """Like pysoem.CdefCoeObjectEntry (one subindex)."""
+
+    def __init__(self, name, data_type, bit_length, obj_access):
+        self.name, self.data_type = name, data_type
+        self.bit_length, self.obj_access = bit_length, obj_access
+
+
+class CoeObject:
+    """Like pysoem.CdefCoeObject. Description and entries are read lazily and
+    use the shim's last OD list, so read one slave's ``od`` at a time."""
+
+    def __init__(self, slave, item, index):
+        self._slave, self._item, self.index = slave, item, index
+        self._desc = None
+        self._oe = None
+
+    def _read_desc(self):
+        if self._desc is None:
+            dt, oc, ms, name = _I(), _I(), _I(), ctypes.create_string_buffer(_NAME_LEN)
+            with self._slave._m._lock:
+                _ecm_od_desc(self._slave._h, self._item, ctypes.byref(dt), ctypes.byref(oc),
+                             ctypes.byref(ms), name)
+                self._slave._m._drain_errors(self._slave)
+            self._desc = (dt.value, oc.value, ms.value, name.value)
+        return self._desc
+
+    def _read_entries(self):
+        if self._oe is None:
+            self._read_desc()
+            n = _I()
+            entries = []
+            with self._slave._m._lock:
+                _ecm_od_entries(self._slave._h, self._item, ctypes.byref(n))
+                self._slave._m._drain_errors(self._slave)
+                for i in range(max(n.value, 0)):
+                    dt, bl, acc = _I(), _I(), _I()
+                    name = ctypes.create_string_buffer(_NAME_LEN)
+                    _ecm_oe_get(self._slave._h, i, ctypes.byref(dt), ctypes.byref(bl),
+                                ctypes.byref(acc), name)
+                    entries.append(CoeObjectEntry(name.value, dt.value, bl.value, acc.value))
+            self._oe = entries
+        return self._oe
+
+    @property
+    def data_type(self):
+        return self._read_desc()[0]
+
+    @property
+    def object_code(self):
+        return self._read_desc()[1]
+
+    @property
+    def name(self):
+        return self._read_desc()[3]
+
+    @property
+    def entries(self):
+        if self.object_code == _OBJ_CODE_VAR:
+            return []
+        return self._read_entries()
+
+    @property
+    def bit_length(self):
+        oe = self._read_entries()
+        if self.object_code == _OBJ_CODE_VAR:
+            return oe[0].bit_length if oe else 0
+        return sum(e.bit_length for e in oe)
+
+    @property
+    def obj_access(self):
+        oe = self._read_entries()
+        return oe[0].obj_access if oe else 0
 
 Adapter = namedtuple("Adapter", ["name", "desc"])
 
@@ -191,16 +284,19 @@ def find_adapters():
     return [Adapter(_s(names, i), _s(descs, i)) for i in range(count)]
 
 
-def _raise_from(err):
+def _exc_from(err):
+    """Exception object for a SOEM error list entry (like pysoem's error types)."""
     if err.etype == _ERR_SDO:
-        raise SdoError(err.slave, err.index, err.subidx, err.abort_code)
+        return SdoError(err.slave, err.index, err.subidx, err.abort_code)
     if err.etype == _ERR_EMERGENCY:
-        raise Emergency(err.slave, err.error_code, err.error_reg, err.b1, err.w1, err.w2)
+        return Emergency(err.slave, err.error_code, err.error_reg, err.b1, err.w1, err.w2)
     if err.etype == _ERR_PACKET:
-        raise PacketError(err.slave, err.error_code)
-    if err.etype == _ERR_MBX:
-        raise MailboxError(err.slave, err.error_code)
-    raise MailboxError(err.slave, err.error_code)
+        return PacketError(err.slave, err.error_code)
+    return MailboxError(err.slave, err.error_code)
+
+
+def _raise_from(err):
+    raise _exc_from(err)
 
 
 class Master:
@@ -239,7 +335,7 @@ class Master:
             size = _ecm_config_map(self._h, 0)
             errors = self._drain_errors()
             if errors:
-                raise ConfigMapError(errors)
+                raise ConfigMapError([_exc_from(e) for e in errors])
             return size
 
     def config_dc(self):
@@ -401,6 +497,39 @@ class Slave:
         data = bytes(data)
         wkc = _ecm_sdo_write(self._h, self._pos, index, subindex, int(bool(ca)), data, len(data))
         self._check(wkc)
+
+    def foe_write(self, filename, password, data, timeout=200000, release_gil=None):
+        if _ecm_foe_write is None:
+            raise NotImplementedError("libecm without FoE support, rebuild the shim")
+        data = bytes(data)
+        wkc = _ecm_foe_write(self._h, self._pos, filename.encode(), password & 0xFFFFFFFF,
+                             data, len(data), int(timeout))
+        self._check(wkc)
+        return wkc
+
+    def foe_read(self, filename, password, size, timeout=200000, release_gil=None):
+        if _ecm_foe_read is None:
+            raise NotImplementedError("libecm without FoE support, rebuild the shim")
+        buf = (ctypes.c_uint8 * size)()
+        sz = _I(size)
+        wkc = _ecm_foe_read(self._h, self._pos, filename.encode(), password & 0xFFFFFFFF,
+                            buf, ctypes.byref(sz), int(timeout))
+        self._check(wkc)
+        return bytes(buf[:sz.value])
+
+    @property
+    def od(self):
+        """Object dictionary via SDO information (re-read on every access, like pysoem)."""
+        if _ecm_od_list is None:
+            raise NotImplementedError("libecm without SDO info support, rebuild the shim")
+        with self._m._lock:
+            n = _ecm_od_list(self._h, self._pos)
+            errors = self._m._drain_errors(self)
+            if n < 0:
+                if errors:
+                    _raise_from(errors[0])
+                raise WkcError(0)
+            return [CoeObject(self, i, _ecm_od_index(self._h, i)) for i in range(n)]
 
     def write_state(self):
         return _ecm_write_state(self._h, self._pos)

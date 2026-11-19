@@ -17,6 +17,9 @@ typedef struct
    uint8 iomap[ECM_IOMAP_SIZE];
    int sdo_read_timeout;
    int sdo_write_timeout;
+   int opened;
+   ec_ODlistt odlist;   /* last object dictionary list read (SDO info) */
+   ec_OElistt oelist;   /* last object entry list read */
 } ecm_master;
 
 typedef struct
@@ -68,8 +71,23 @@ ECM_API ecm_master *ecm_create(void)
 }
 
 ECM_API void ecm_destroy(ecm_master *m) { free(m); }
-ECM_API int ecm_open(ecm_master *m, const char *ifname) { return ecx_init(&m->ctx, ifname); }
-ECM_API void ecm_close(ecm_master *m) { ecx_close(&m->ctx); }
+ECM_API int ecm_open(ecm_master *m, const char *ifname)
+{
+   int rc = ecx_init(&m->ctx, ifname);
+   m->opened = rc > 0;
+   return rc;
+}
+
+/* ecx_close() frees the mailbox mutexes without clearing the pointers, so a
+ * second close (or close after a failed scan) is a double free. */
+ECM_API void ecm_close(ecm_master *m)
+{
+   if (!m->opened) return;
+   ecx_close(&m->ctx);
+   for (int lp = 0; lp < EC_MAXGROUP; lp++) m->ctx.grouplist[lp].mbxtxqueue.mbxmutex = NULL;
+   m->ctx.mbxpool.mbxmutex = NULL;
+   m->opened = 0;
+}
 ECM_API int ecm_config_init(ecm_master *m) { return ecx_config_init(&m->ctx); }
 ECM_API int ecm_slavecount(ecm_master *m) { return m->ctx.slavecount; }
 
@@ -129,16 +147,83 @@ ECM_API int ecm_reconfig(ecm_master *m, int slave, int timeout_us) { return ecx_
 ECM_API int ecm_send(ecm_master *m) { return ecx_send_processdata(&m->ctx); }
 ECM_API int ecm_receive(ecm_master *m, int timeout_us) { return ecx_receive_processdata(&m->ctx, timeout_us); }
 
+/* SOEM 2.x ecx_mbxsend() refuses to send while the cached slave state is
+ * below PRE-OP (SOEM 1.4 did not check). config_init() only requests PRE-OP
+ * and nothing refreshes slavelist[].state until read_state(), so every SDO
+ * would fail with WKC 0. Refresh the AL status of that slave first. */
+static void ecm_refresh_state(ecm_master *m, int slave)
+{
+   ec_slavet *s = &m->ctx.slavelist[slave];
+   uint16 al = 0;
+   if ((s->state & 0x0f) >= EC_STATE_PRE_OP) return;
+   if (ecx_FPRD(&m->ctx.port, s->configadr, ECT_REG_ALSTAT, sizeof(al), &al, EC_TIMEOUTRET) > 0)
+      s->state = etohs(al);
+}
+
 ECM_API int ecm_sdo_read(ecm_master *m, int slave, int index, int sub, int ca, uint8 *buf, int *size)
 {
+   ecm_refresh_state(m, slave);
    return ecx_SDOread(&m->ctx, (uint16)slave, (uint16)index, (uint8)sub, ca ? TRUE : FALSE,
                       size, buf, m->sdo_read_timeout);
 }
 
 ECM_API int ecm_sdo_write(ecm_master *m, int slave, int index, int sub, int ca, const uint8 *buf, int size)
 {
+   ecm_refresh_state(m, slave);
    return ecx_SDOwrite(&m->ctx, (uint16)slave, (uint16)index, (uint8)sub, ca ? TRUE : FALSE,
                        size, buf, m->sdo_write_timeout);
+}
+
+ECM_API int ecm_foe_write(ecm_master *m, int slave, const char *filename, uint32 password,
+                          const uint8 *buf, int size, int timeout_us)
+{
+   ecm_refresh_state(m, slave);
+   return ecx_FOEwrite(&m->ctx, (uint16)slave, (char *)filename, password, size, (void *)buf, timeout_us);
+}
+
+ECM_API int ecm_foe_read(ecm_master *m, int slave, const char *filename, uint32 password,
+                         uint8 *buf, int *size, int timeout_us)
+{
+   ecm_refresh_state(m, slave);
+   return ecx_FOEread(&m->ctx, (uint16)slave, (char *)filename, password, size, buf, timeout_us);
+}
+
+/* Object dictionary (SDO information service), see pysoem CdefSlave.od */
+ECM_API int ecm_od_list(ecm_master *m, int slave)
+{
+   ecm_refresh_state(m, slave);
+   memset(&m->odlist, 0, sizeof(m->odlist));
+   if (ecx_readODlist(&m->ctx, (uint16)slave, &m->odlist) <= 0) return -1;
+   return m->odlist.Entries;
+}
+
+ECM_API int ecm_od_index(ecm_master *m, int item) { return m->odlist.Index[item]; }
+
+ECM_API int ecm_od_desc(ecm_master *m, int item, int *datatype, int *objcode, int *maxsub, char *name)
+{
+   int wkc = ecx_readODdescription(&m->ctx, (uint16)item, &m->odlist);
+   *datatype = m->odlist.DataType[item];
+   *objcode = m->odlist.ObjectCode[item];
+   *maxsub = m->odlist.MaxSub[item];
+   memcpy(name, m->odlist.Name[item], EC_MAXNAME + 1);
+   return wkc;
+}
+
+ECM_API int ecm_od_entries(ecm_master *m, int item, int *n)
+{
+   int wkc;
+   memset(&m->oelist, 0, sizeof(m->oelist));
+   wkc = ecx_readOE(&m->ctx, (uint16)item, &m->odlist, &m->oelist);
+   *n = m->oelist.Entries;
+   return wkc;
+}
+
+ECM_API void ecm_oe_get(ecm_master *m, int i, int *datatype, int *bitlen, int *access, char *name)
+{
+   *datatype = m->oelist.DataType[i];
+   *bitlen = m->oelist.BitLength[i];
+   *access = m->oelist.ObjAccess[i];
+   memcpy(name, m->oelist.Name[i], EC_MAXNAME + 1);
 }
 
 ECM_API int ecm_pop_error(ecm_master *m, ecm_error *o)
